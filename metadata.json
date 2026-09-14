@@ -1,0 +1,10 @@
+{
+  "name": "Photo Addition Calculator",
+  "description": "Scan or take a photo of vertically listed numbers to automatically calculate single or multi-column sums, with editable session notes, current date stamping, and PDF/Excel export.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
