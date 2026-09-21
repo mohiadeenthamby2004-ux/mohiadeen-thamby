@@ -40,6 +40,7 @@ export const PWAInstallModal: React.FC<PWAInstallModalProps> = ({
 
   const currentUrl = typeof window !== "undefined" ? window.location.href : "";
   const pwabuilderUrl = `https://www.pwabuilder.com/?url=${encodeURIComponent(currentUrl)}`;
+  const directApkUrl = "/app-debug.apk";
   const androidZipDownloadUrl = "/PhotoAdditionCalculator-AndroidProject.zip";
 
   const handleCopyUrl = () => {
@@ -62,7 +63,7 @@ export const PWAInstallModal: React.FC<PWAInstallModalProps> = ({
                 Android App &amp; APK Files
               </h3>
               <p className="text-xs text-slate-500 dark:text-slate-400">
-                Install or download Photo Addition Calculator for Android
+                Install or download Measurement Chart for Android
               </p>
             </div>
           </div>
@@ -106,6 +107,39 @@ export const PWAInstallModal: React.FC<PWAInstallModalProps> = ({
         <div className="p-6 space-y-4 max-h-[70vh] overflow-y-auto">
           {activeTab === "apk" ? (
             <div className="space-y-4">
+              {/* Option 0: Direct Download of Compiled APK */}
+              <div className="p-4 rounded-xl bg-emerald-50/80 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/70 space-y-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-3">
+                    <div className="p-2 rounded-lg bg-emerald-600 text-white shrink-0 mt-0.5 shadow-xs">
+                      <Download className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <h4 className="text-sm font-semibold text-emerald-950 dark:text-emerald-100">
+                          Compiled Debug APK (Ready to Install)
+                        </h4>
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-200 dark:bg-emerald-800 text-emerald-800 dark:text-emerald-100">
+                          5.4 MB
+                        </span>
+                      </div>
+                      <p className="text-xs text-emerald-700 dark:text-emerald-300 mt-1 leading-relaxed">
+                        Pre-compiled Android APK ready for immediate sideloading onto Android 7.0+ devices.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <a
+                  href={directApkUrl}
+                  download="app-debug.apk"
+                  className="w-full py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs inline-flex items-center justify-center gap-2 transition-colors cursor-pointer shadow-sm"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>Download app-debug.apk (5.4 MB)</span>
+                </a>
+              </div>
+
               {/* Option 1: Direct Cloud APK Build */}
               <div className="p-4 rounded-xl bg-blue-50/80 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/70 space-y-3">
                 <div className="flex items-start justify-between gap-3">
@@ -199,7 +233,7 @@ export const PWAInstallModal: React.FC<PWAInstallModalProps> = ({
                       Already Installed!
                     </h4>
                     <p className="text-xs text-emerald-700 dark:text-emerald-300 mt-0.5">
-                      You are running Photo Addition Calculator in standalone application mode.
+                      You are running Measurement Chart in standalone application mode.
                     </p>
                   </div>
                 </div>
@@ -226,7 +260,7 @@ export const PWAInstallModal: React.FC<PWAInstallModalProps> = ({
                     className="w-full py-2.5 px-4 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-semibold text-sm inline-flex items-center justify-center gap-2 transition-colors cursor-pointer shadow-md"
                   >
                     <Download className="w-4 h-4" />
-                    <span>Install Photo Addition Calculator</span>
+                    <span>Install Measurement Chart</span>
                   </button>
                 </div>
               ) : (

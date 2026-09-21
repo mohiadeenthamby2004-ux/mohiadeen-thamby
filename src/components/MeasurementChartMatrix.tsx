@@ -13,8 +13,12 @@ import {
   CheckCircle,
   Plus,
   Trash2,
+  Share2,
+  Eye,
+  Download,
 } from "lucide-react";
-import { computeSafeSum } from "../utils/math";
+import { computeSafeSum, formatDisplayNumber, normalize3DigitValue } from "../utils/math";
+import { AnimatedGrandTotal } from "./AnimatedGrandTotal";
 
 interface MeasurementChartMatrixProps {
   columns: VerticalColumnLine[];
@@ -25,7 +29,10 @@ interface MeasurementChartMatrixProps {
   calculationDate?: Date | string | number;
   onUpdateColumns: (newColumns: VerticalColumnLine[]) => void;
   onExportPdf?: () => void;
+  onSharePdf?: () => void;
+  onPreviewPdf?: () => void;
   onExportExcel?: () => void;
+  onShareExcel?: () => void;
   onCopy?: () => void;
   copied?: boolean;
 }
@@ -38,7 +45,10 @@ export const MeasurementChartMatrix: React.FC<MeasurementChartMatrixProps> = ({
   calculationDate,
   onUpdateColumns,
   onExportPdf,
+  onSharePdf,
+  onPreviewPdf,
   onExportExcel,
+  onShareExcel,
   onCopy,
   copied,
 }) => {
@@ -47,12 +57,22 @@ export const MeasurementChartMatrix: React.FC<MeasurementChartMatrixProps> = ({
   const [hoveredRow, setHoveredRow] = useState<number | null>(null);
   const [hoveredCol, setHoveredCol] = useState<number | null>(null);
 
-  const totalPieces = columns.reduce((acc, col) => acc + col.items.length, 0);
+  const totalPieces = columns.reduce((acc, col) => acc + (col.items?.length || 0), 0);
   const calculatedGrandTotal = grandTotal ?? computeSafeSum(columns.map((c) => c.sum)).sum;
-  const averageSqFt = totalPieces > 0 ? (calculatedGrandTotal / totalPieces).toFixed(2) : "0.00";
 
-  // Find max rows across all columns (typically up to 30)
-  const maxRows = Math.max(...columns.map((c) => c.items.length), 30);
+  const isTannery = Boolean(
+    measurementMetadata?.companyName?.toUpperCase().includes("EVERWIN") ||
+    measurementMetadata?.documentTitle?.toUpperCase().includes("MEASUREMENT LIST") ||
+    measurementMetadata?.article
+  );
+
+  const unitLabel = measurementMetadata?.unit || (isTannery ? "Sq' Ft" : "");
+  const piecesLabel = isTannery ? "hides" : "entries";
+
+  // Find max rows across all columns: only use 30 if full page tannery sheet
+  const maxDataRows = Math.max(...columns.map((c) => c.items?.length || 0), 1);
+  const maxRows = isTannery ? Math.max(maxDataRows, 30) : maxDataRows;
+  const averageValue = totalPieces > 0 ? (calculatedGrandTotal / totalPieces).toFixed(2) : "0.00";
 
   const handleStartEdit = (colIdx: number, itemIdx: number, currentVal: number) => {
     setEditingCell({ colIdx, itemIdx });
@@ -62,7 +82,7 @@ export const MeasurementChartMatrix: React.FC<MeasurementChartMatrixProps> = ({
   const handleSaveEdit = () => {
     if (!editingCell) return;
     const { colIdx, itemIdx } = editingCell;
-    const parsed = parseFloat(editValue);
+    const parsed = normalize3DigitValue(editValue);
 
     if (!isNaN(parsed) && parsed >= 0) {
       const updated = columns.map((col, cIdx) => {
@@ -110,18 +130,24 @@ export const MeasurementChartMatrix: React.FC<MeasurementChartMatrixProps> = ({
             <div className="flex items-center gap-2 mb-1.5 flex-wrap">
               <span className="px-2.5 py-0.5 rounded-full bg-emerald-500/30 text-emerald-200 border border-emerald-400/30 text-xs font-semibold uppercase tracking-wider flex items-center gap-1">
                 <Building2 className="w-3.5 h-3.5" />
-                Industrial Measurement Chart
+                {isTannery ? "Leather Measurement List" : "Measurement Chart Matrix"}
               </span>
               <span className="text-xs text-emerald-200/80 font-mono">
-                {measurementMetadata?.date ? `Date: ${measurementMetadata.date}` : "Full Page Sheet"}
+                {measurementMetadata?.date ? `Date: ${measurementMetadata.date}` : "Verified Sheet"}
+              </span>
+              <span
+                className="text-[11px] px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-200 border border-emerald-400/30 font-mono"
+                title="Rule active: When performing addition, any 3-digit number has a decimal point placed after the first two digits (e.g., 333 as 33.3)"
+              >
+                Rule: 3-digit (e.g. 333 = 33.3)
               </span>
             </div>
             <h2 className="text-xl sm:text-2xl font-bold tracking-tight text-white">
-              {measurementMetadata?.companyName || "EVERWIN TANNERS - MELVISHARAM"}
+              {measurementMetadata?.companyName || "Measurement Chart Matrix"}
             </h2>
             <p className="text-xs sm:text-sm text-emerald-100/80 mt-1 flex items-center gap-2 flex-wrap">
               <span className="font-semibold text-emerald-300">
-                {measurementMetadata?.documentTitle || "MEASUREMENT LIST"}
+                {measurementMetadata?.documentTitle || "MULTIPLE COLUMNS CALCULATION"}
               </span>
               {measurementMetadata?.article && (
                 <>
@@ -130,87 +156,128 @@ export const MeasurementChartMatrix: React.FC<MeasurementChartMatrixProps> = ({
                 </>
               )}
               <span>•</span>
-              <span>8 Columns across 3 Sections</span>
+              <span>{columns.length} Columns ({totalPieces} {piecesLabel})</span>
             </p>
           </div>
 
           {/* Quick Export & Actions */}
           <div className="flex items-center gap-2 shrink-0 flex-wrap">
-            {onExportExcel && (
-              <button
-                type="button"
-                onClick={onExportExcel}
-                className="px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold inline-flex items-center gap-1.5 transition-colors shadow-sm cursor-pointer"
-                title="Download Excel spreadsheet with full measurement matrix"
-              >
-                <FileSpreadsheet className="w-4 h-4" />
-                <span>Export Matrix (Excel)</span>
-              </button>
-            )}
-            {onExportPdf && (
-              <button
-                type="button"
-                onClick={onExportPdf}
-                className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 border border-slate-700 transition-colors shadow-sm cursor-pointer"
-                title="Download PDF report"
-              >
-                <FileText className="w-4 h-4 text-rose-400" />
-                <span>PDF</span>
-              </button>
-            )}
+            {/* Excel Actions */}
+            <div className="inline-flex rounded-xl bg-emerald-950/80 p-0.5 border border-emerald-700/60 shadow-xs">
+              {onExportExcel && (
+                <button
+                  type="button"
+                  onClick={onExportExcel}
+                  className="px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+                  title="Download Excel spreadsheet (.xlsx)"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5" />
+                  <span>Excel</span>
+                </button>
+              )}
+              {onShareExcel && (
+                <button
+                  type="button"
+                  onClick={onShareExcel}
+                  className="px-2 py-1.5 rounded-lg hover:bg-emerald-800/70 text-emerald-200 text-xs font-medium inline-flex items-center gap-1 transition-colors cursor-pointer"
+                  title="Share Excel file via WhatsApp, Email, or Bluetooth"
+                >
+                  <Share2 className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Share</span>
+                </button>
+              )}
+            </div>
+
+            {/* PDF Actions */}
+            <div className="inline-flex rounded-xl bg-slate-900/90 p-0.5 border border-slate-700/80 shadow-xs">
+              {onExportPdf && (
+                <button
+                  type="button"
+                  onClick={onExportPdf}
+                  className="px-2.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+                  title="Download PDF report (.pdf)"
+                >
+                  <FileText className="w-3.5 h-3.5" />
+                  <span>PDF</span>
+                </button>
+              )}
+              {onSharePdf && (
+                <button
+                  type="button"
+                  onClick={onSharePdf}
+                  className="px-2 py-1.5 rounded-lg hover:bg-slate-800 text-rose-200 text-xs font-medium inline-flex items-center gap-1 transition-colors cursor-pointer"
+                  title="Share PDF report file via WhatsApp, Email, or Bluetooth"
+                >
+                  <Share2 className="w-3.5 h-3.5 text-rose-300" />
+                  <span className="hidden sm:inline">Share</span>
+                </button>
+              )}
+              {onPreviewPdf && (
+                <button
+                  type="button"
+                  onClick={onPreviewPdf}
+                  className="px-2 py-1.5 rounded-lg hover:bg-slate-800 text-slate-300 text-xs font-medium inline-flex items-center gap-1 transition-colors cursor-pointer"
+                  title="Preview / Print PDF in browser tab"
+                >
+                  <Eye className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+
             {onCopy && (
               <button
                 type="button"
                 onClick={onCopy}
-                className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 border border-slate-700 transition-colors shadow-sm cursor-pointer"
+                className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 border border-slate-700 transition-colors shadow-sm cursor-pointer"
+                title="Copy full matrix numbers to clipboard"
               >
-                {copied ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4 text-slate-300" />}
+                {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5 text-slate-300" />}
                 <span>{copied ? "Copied" : "Copy"}</span>
               </button>
             )}
           </div>
         </div>
 
-        {/* 3 Prominent Metrics Bar */}
+        {/* 4 Prominent Metrics Bar */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-5 pt-4 border-t border-emerald-800/60">
           <div className="bg-emerald-950/60 rounded-xl p-3 border border-emerald-700/40">
             <div className="text-[11px] font-semibold text-emerald-300 uppercase tracking-wider">
-              Total Pieces / Hides
+              Total Count
             </div>
             <div className="font-mono text-2xl font-black text-white mt-0.5">
               {totalPieces}
             </div>
-            <div className="text-[10px] text-emerald-300/80 mt-0.5">Hides measured</div>
+            <div className="text-[10px] text-emerald-300/80 mt-0.5">{piecesLabel} counted</div>
           </div>
 
           <div className="bg-emerald-950/60 rounded-xl p-3 border border-emerald-700/40">
             <div className="text-[11px] font-semibold text-emerald-300 uppercase tracking-wider">
-              Total Sq. Ft.
+              Grand Total {unitLabel ? `(${unitLabel})` : ""}
             </div>
             <div className="font-mono text-2xl font-black text-emerald-300 mt-0.5">
-              {calculatedGrandTotal.toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 })}
+              <AnimatedGrandTotal value={calculatedGrandTotal} showIndicator />
             </div>
-            <div className="text-[10px] text-emerald-300/80 mt-0.5">Total leather area</div>
+            <div className="text-[10px] text-emerald-300/80 mt-0.5">Combined sum</div>
           </div>
 
           <div className="bg-emerald-950/60 rounded-xl p-3 border border-emerald-700/40">
             <div className="text-[11px] font-semibold text-emerald-300 uppercase tracking-wider">
-              Average Area
+              Average
             </div>
             <div className="font-mono text-2xl font-black text-white mt-0.5">
-              {averageSqFt}
+              {averageValue}
             </div>
-            <div className="text-[10px] text-emerald-300/80 mt-0.5">Sq&apos; Ft per hide</div>
+            <div className="text-[10px] text-emerald-300/80 mt-0.5">Per {piecesLabel.slice(0, -1) || "item"}</div>
           </div>
 
           <div className="bg-emerald-950/60 rounded-xl p-3 border border-emerald-700/40">
             <div className="text-[11px] font-semibold text-emerald-300 uppercase tracking-wider">
-              Full Page Columns
+              Columns
             </div>
             <div className="font-mono text-2xl font-black text-white mt-0.5">
               {columns.length}
             </div>
-            <div className="text-[10px] text-emerald-300/80 mt-0.5">3 Section layout</div>
+            <div className="text-[10px] text-emerald-300/80 mt-0.5">Vertical tallies</div>
           </div>
         </div>
       </div>
@@ -342,7 +409,7 @@ export const MeasurementChartMatrix: React.FC<MeasurementChartMatrixProps> = ({
                           title={`Row ${rIdx + 1}, ${col.title}: ${item.value} Sq' Ft (Click to edit)`}
                         >
                           <div className="flex items-center justify-end gap-1">
-                            <span className="font-semibold text-xs">{item.value.toFixed(1)}</span>
+                            <span className="font-semibold text-xs">{formatDisplayNumber(item.value)}</span>
                             <Edit2 className="w-2.5 h-2.5 opacity-0 group-hover:opacity-60 text-slate-400" />
                           </div>
                         </td>
@@ -365,22 +432,22 @@ export const MeasurementChartMatrix: React.FC<MeasurementChartMatrixProps> = ({
                     key={col.id}
                     className="p-2.5 text-right text-xs font-black text-emerald-700 dark:text-emerald-300 border-r border-slate-200 dark:border-slate-700"
                   >
-                    {col.sum.toFixed(1)}
+                    {formatDisplayNumber(col.sum)}
                   </td>
                 ))}
               </tr>
 
               {/* Pieces Row */}
               <tr className="bg-slate-50 dark:bg-slate-800/70 text-[10px]">
-                <td className="p-2 text-center text-slate-500 dark:text-slate-400 border-r border-slate-200 dark:border-slate-700">
-                  Hides
+                <td className="p-2 text-center text-slate-500 dark:text-slate-400 border-r border-slate-200 dark:border-slate-700 capitalize">
+                  {piecesLabel}
                 </td>
                 {columns.map((col) => (
                   <td
                     key={col.id}
                     className="p-2 text-right text-slate-600 dark:text-slate-400 border-r border-slate-200 dark:border-slate-700"
                   >
-                    {col.items.length} pcs
+                    {col.items?.length || 0} pcs
                   </td>
                 ))}
               </tr>
@@ -394,25 +461,31 @@ export const MeasurementChartMatrix: React.FC<MeasurementChartMatrixProps> = ({
             <CheckCircle className="w-5 h-5 text-emerald-400" />
             <div>
               <div className="text-xs text-slate-300">
-                Verified Full-Page Measurement Total
+                Verified Combined Column Total
               </div>
               <div className="text-xs text-emerald-400 font-mono">
-                {columns.map((c) => `${c.sum.toFixed(1)}`).join(" + ")} = {calculatedGrandTotal.toFixed(1)}
+                {columns.map((c) => `${formatDisplayNumber(c.sum)}`).join(" + ")} = {formatDisplayNumber(calculatedGrandTotal)}
               </div>
             </div>
           </div>
 
           <div className="flex items-center gap-4">
             <div className="text-right">
-              <span className="text-[11px] text-slate-400 uppercase tracking-wider">Total Leather Area:</span>
+              <span className="text-[11px] text-slate-400 uppercase tracking-wider">
+                {isTannery ? "Total Leather Area:" : "Grand Total:"}
+              </span>
               <div className="text-xl font-extrabold text-emerald-400 font-mono">
-                {calculatedGrandTotal.toFixed(1)} Sq&apos; Ft
+                <AnimatedGrandTotal
+                  value={calculatedGrandTotal}
+                  suffix={unitLabel ? ` ${unitLabel}` : undefined}
+                  showIndicator
+                />
               </div>
             </div>
             <div className="text-right border-l border-slate-700 pl-4">
-              <span className="text-[11px] text-slate-400 uppercase tracking-wider">Total Pieces:</span>
+              <span className="text-[11px] text-slate-400 uppercase tracking-wider">Total Count:</span>
               <div className="text-xl font-extrabold text-white font-mono">
-                {totalPieces} hides
+                {totalPieces} {piecesLabel}
               </div>
             </div>
           </div>

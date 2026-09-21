@@ -2,6 +2,7 @@ import {StrictMode} from 'react';
 import {createRoot} from 'react-dom/client';
 import App from './App.tsx';
 import './index.css';
+import { registerSW } from 'virtual:pwa-register';
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
@@ -9,11 +10,14 @@ createRoot(document.getElementById('root')!).render(
   </StrictMode>,
 );
 
-// Register service worker only in production to prevent dev websocket/HMR errors
-if ('serviceWorker' in navigator && import.meta.env.PROD) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('/sw.js').catch((err) => {
-      console.warn('PWA service worker registration failed:', err);
-    });
-  });
-}
+// Register service worker for complete offline reliability and auto updates
+registerSW({
+  immediate: true,
+  onRegistered(r) {
+    console.log('PWA Service Worker successfully registered:', r?.scope);
+  },
+  onRegisterError(error) {
+    console.warn('PWA Service Worker registration notice:', error);
+  },
+});
+

@@ -41,12 +41,12 @@ export function buildShareText({
     const totalVal = grandTotal ?? sum;
     const formulaLine = grandFormula ? `\nFormula: ${grandFormula}` : "";
 
-    return `🧮 ${title || "Vertical Column Calculation"}\n\n${linesText}\n\n====================\n⭐ GRAND TOTAL: ${totalVal}${formulaLine}\n\nCalculated with Photo Addition Calculator`;
+    return `🧮 ${title || "Vertical Column Calculation"}\n\n${linesText}\n\n====================\n⭐ GRAND TOTAL: ${totalVal}${formulaLine}\n\nCalculated with Measurement Chart`;
   }
 
   // Single column
   const ascii = formatVerticalColumn(items, sum);
-  return `🧮 ${title || "Vertical Addition Calculation"}\n\n${ascii}\n\n⭐ Final Result: ${sum}\nFormula: ${items.map((i) => i.value).join(" + ")} = ${sum}\n\nCalculated with Photo Addition Calculator`;
+  return `🧮 ${title || "Vertical Addition Calculation"}\n\n${ascii}\n\n⭐ Final Result: ${sum}\nFormula: ${items.map((i) => i.value).join(" + ")} = ${sum}\n\nCalculated with Measurement Chart`;
 }
 
 /**
@@ -68,7 +68,7 @@ async function dataUrlToFile(dataUrl: string, filename = "vertical-calculation.j
  */
 export async function shareCalculation(params: ShareCalculationParams): Promise<ShareResult> {
   const textContent = buildShareText(params);
-  const shareTitle = params.title || "Photo Vertical Addition Result";
+  const shareTitle = params.title || "Measurement Chart Calculation Result";
 
   // Check if Web Share API is available in current browser / context
   if (typeof navigator !== "undefined" && typeof navigator.share === "function") {

@@ -1,8 +1,211 @@
-import { DetectedNumberItem } from "../types";
+import { CalculationResult, DetectedNumberItem, VerticalColumnLine } from "../types";
+
+/**
+ * Rule / Specification:
+ * "When performing addition, any 3-digit number should have a decimal point placed
+ * after the first two digits (e.g., assume 333 as 33.3)."
+ *
+ * Examples:
+ * - 333 -> 33.3
+ * - 322 -> 32.2
+ * - 180 -> 18.0
+ * - 245 -> 24.5
+ * - 100 -> 10.0
+ * - 33.3 -> 33.3 (already decimal, unchanged)
+ * - 25 -> 25 (2 digits, unchanged)
+ * - 4475 -> 4475 (4 digits, unchanged)
+ */
+export function normalize3DigitValue(val: number | string | null | undefined): number {
+  if (val == null) return 0;
+
+  if (typeof val === "string") {
+    const trimmed = val.trim().replace(/,/g, "").replace(/-$/, "");
+    // Check if exactly 3 digits (optional leading +/- sign) without decimal point
+    if (/^[+-]?\d{3}$/.test(trimmed)) {
+      const parsedInt = parseInt(trimmed, 10);
+      return Number((parsedInt / 10).toFixed(1));
+    }
+    const parsedFloat = parseFloat(trimmed);
+    if (isNaN(parsedFloat)) return 0;
+    val = parsedFloat;
+  }
+
+  if (typeof val === "number" && !isNaN(val)) {
+    const absVal = Math.abs(val);
+    // If it is an integer with exactly 3 digits (100 through 999)
+    if (Number.isInteger(val) && absVal >= 100 && absVal <= 999) {
+      return Number((val / 10).toFixed(1));
+    }
+    return val;
+  }
+
+  return 0;
+}
+
+/**
+ * Formats a 3-digit input or number for display showing original and normalized value if changed
+ */
+export function formatNormalizedInputHint(rawText: string | number): string {
+  const normalized = normalize3DigitValue(rawText);
+  const rawNum = typeof rawText === "number" ? rawText : parseFloat(String(rawText).replace(/-$/, ""));
+  if (!isNaN(rawNum) && Number.isInteger(rawNum) && Math.abs(rawNum) >= 100 && Math.abs(rawNum) <= 999) {
+    return `${rawNum} → ${normalized}`;
+  }
+  return String(rawText);
+}
+
+export interface ColumnSummaryItem {
+  id: string;
+  title: string;
+  count: number;
+  sum: number;
+  average: number;
+  percentage: number;
+  formula: string;
+  items: DetectedNumberItem[];
+}
+
+export interface GrandSummaryResult {
+  columns: ColumnSummaryItem[];
+  grandTotal: number;
+  totalCount: number;
+  average: number;
+  columnCount: number;
+}
+
+/**
+ * Calculates a clean, high-level summary of multiple vertical columns
+ */
+export function calculateColumnSummaries(
+  columns: VerticalColumnLine[],
+  providedGrandTotal?: number
+): GrandSummaryResult {
+  const totalCount = columns.reduce((acc, col) => acc + (col.items?.length || 0), 0);
+  const columnSums = columns.map((col) => col.sum);
+  const calculatedGrandTotal = providedGrandTotal ?? computeSafeSum(columnSums).sum;
+  const overallAvg = totalCount > 0 ? Number((calculatedGrandTotal / totalCount).toFixed(2)) : 0;
+
+  const summaryItems: ColumnSummaryItem[] = columns.map((col) => {
+    const count = col.items?.length || 0;
+    const colSum = col.sum;
+    const avg = count > 0 ? Number((colSum / count).toFixed(2)) : 0;
+    const pct = calculatedGrandTotal > 0 ? Number(((colSum / calculatedGrandTotal) * 100).toFixed(1)) : 0;
+
+    return {
+      id: col.id,
+      title: col.title,
+      count,
+      sum: colSum,
+      average: avg,
+      percentage: pct,
+      formula: col.formula,
+      items: col.items || [],
+    };
+  });
+
+  return {
+    columns: summaryItems,
+    grandTotal: calculatedGrandTotal,
+    totalCount,
+    average: overallAvg,
+    columnCount: columns.length,
+  };
+}
+
+/**
+ * Partitions an array of DetectedNumberItem into multiple VerticalColumnLines
+ * Intelligently clusters by bounding box X coordinates if available, or distributes evenly across N columns.
+ */
+export function partitionIntoMultipleColumns(
+  items: DetectedNumberItem[],
+  targetColCount: number = 4
+): VerticalColumnLine[] {
+  if (!items || items.length === 0) return [];
+  const safeCols = Math.max(2, Math.min(targetColCount, 12));
+
+  // Check if box_2d is available with distinct X coordinates
+  const itemsWithBoxes = items.filter(
+    (it) => Array.isArray(it.box_2d) && it.box_2d.length === 4
+  );
+
+  let buckets: DetectedNumberItem[][] = Array.from({ length: safeCols }, () => []);
+
+  if (itemsWithBoxes.length >= Math.min(items.length * 0.5, 4)) {
+    const xCenters = items.map((it) => {
+      if (Array.isArray(it.box_2d) && it.box_2d.length === 4) {
+        return (it.box_2d[1] + it.box_2d[3]) / 2;
+      }
+      return 500;
+    });
+
+    const minX = Math.min(...xCenters);
+    const maxX = Math.max(...xCenters);
+    const range = Math.max(maxX - minX, 50);
+
+    for (const it of items) {
+      let x = 500;
+      if (Array.isArray(it.box_2d) && it.box_2d.length === 4) {
+        x = (it.box_2d[1] + it.box_2d[3]) / 2;
+      }
+      let bucketIdx = Math.floor(((x - minX) / range) * safeCols);
+      if (bucketIdx >= safeCols) bucketIdx = safeCols - 1;
+      if (bucketIdx < 0) bucketIdx = 0;
+      buckets[bucketIdx].push(it);
+    }
+
+    // If clustering left too many empty buckets, fallback to even chunking
+    const nonEmpty = buckets.filter((b) => b.length > 0);
+    if (nonEmpty.length < 2) {
+      buckets = chunkEvenly(items, safeCols);
+    } else {
+      buckets = nonEmpty;
+    }
+  } else {
+    buckets = chunkEvenly(items, safeCols);
+  }
+
+  return buckets.map((colItems, cIdx) => {
+    // Sort items top-to-bottom
+    colItems.sort((a, b) => {
+      const ya = Array.isArray(a.box_2d) && a.box_2d.length === 4 ? a.box_2d[0] : 0;
+      const yb = Array.isArray(b.box_2d) && b.box_2d.length === 4 ? b.box_2d[0] : 0;
+      return ya - yb;
+    });
+
+    const { sum, formula, maxDecimals } = computeSafeSum(colItems);
+
+    return {
+      id: `col-${cIdx + 1}-${Date.now()}`,
+      title: `Column ${cIdx + 1}`,
+      items: colItems.map((it, rIdx) => ({
+        ...it,
+        columnIndex: cIdx,
+        label: `Row ${rIdx + 1}`,
+      })),
+      sum,
+      formula,
+      maxDecimals,
+    };
+  });
+}
+
+function chunkEvenly(items: DetectedNumberItem[], numCols: number): DetectedNumberItem[][] {
+  const result: DetectedNumberItem[][] = Array.from({ length: numCols }, () => []);
+  const itemsPerCol = Math.ceil(items.length / numCols);
+
+  for (let i = 0; i < items.length; i++) {
+    const colIdx = Math.min(Math.floor(i / itemsPerCol), numCols - 1);
+    result[colIdx].push(items[i]);
+  }
+
+  return result.filter((col) => col.length > 0);
+}
+
 
 /**
  * Calculates sum safely without floating point inaccuracies (e.g. 33.3 + 32.2 = 65.5)
- * Accepts either an array of DetectedNumberItem objects, or raw number values.
+ * Accepts either an array of DetectedNumberItem objects, or raw number values, or numeric strings.
+ * Applies rule: any 3-digit number has a decimal point placed after the first two digits (e.g. 333 -> 33.3).
  */
 export function computeSafeSum(itemsOrNumbers: (DetectedNumberItem | number)[]): {
   sum: number;
@@ -10,11 +213,22 @@ export function computeSafeSum(itemsOrNumbers: (DetectedNumberItem | number)[]):
   maxDecimals: number;
 } {
   const numericValues: number[] = [];
-  for (const it of itemsOrNumbers) {
-    if (typeof it === "number") {
-      if (!isNaN(it)) numericValues.push(it);
-    } else if (it && typeof it.value === "number") {
-      if (!isNaN(it.value)) numericValues.push(it.value);
+  if (Array.isArray(itemsOrNumbers)) {
+    for (const it of itemsOrNumbers) {
+      if (typeof it === "number") {
+        if (!isNaN(it)) numericValues.push(normalize3DigitValue(it));
+      } else if (it != null) {
+        const directVal = (it as any).value;
+        if (typeof directVal === "number" && !isNaN(directVal)) {
+          numericValues.push(normalize3DigitValue(directVal));
+        } else {
+          const raw = String(directVal ?? (it as any).rawText ?? "");
+          const parsed = parseFloat(raw.replace(/,/g, "").replace(/-$/, ""));
+          if (!isNaN(parsed)) {
+            numericValues.push(normalize3DigitValue(raw || parsed));
+          }
+        }
+      }
     }
   }
 
@@ -33,11 +247,24 @@ export function computeSafeSum(itemsOrNumbers: (DetectedNumberItem | number)[]):
 
   const factor = Math.pow(10, Math.min(maxDecimals, 8));
   const sumInInt = numericValues.reduce((acc, val) => acc + Math.round(val * factor), 0);
-  const sum = sumInInt / factor;
+  const sum = Number((sumInInt / factor).toFixed(Math.min(maxDecimals, 8)));
 
   const formula = numericValues.join(" + ") + " = " + sum;
 
   return { sum, formula, maxDecimals };
+}
+
+/**
+ * Cleanly formats a number for prominent UI display, avoiding NaN or floating-point glitches
+ */
+export function formatDisplayNumber(val: number | string | undefined | null, minDecimals?: number): string {
+  if (val == null) return "0";
+  const num = typeof val === "number" ? val : parseFloat(String(val).replace(/,/g, "").replace(/-$/, ""));
+  if (isNaN(num)) return "0";
+  if (typeof minDecimals === "number") {
+    return num.toLocaleString(undefined, { minimumFractionDigits: minDecimals, maximumFractionDigits: minDecimals });
+  }
+  return num.toLocaleString(undefined, { maximumFractionDigits: 6 });
 }
 
 /**
@@ -476,4 +703,171 @@ export function generateTanneryMeasurementChartCanvasImage(): string {
   ctx.fillText("GRAND TOTAL: 4,475.0 Sq' Ft", tableX + tableWidth - 20, footerY + 31);
 
   return canvas.toDataURL("image/jpeg", 0.92);
+}
+
+/**
+ * Returns instant, client-side calculation results for presets (works 100% offline)
+ */
+export function getPresetCalculationResult(presetName: string): CalculationResult {
+  if (presetName === "tannery-chart-fullpage") {
+    const cols: VerticalColumnLine[] = EVERWIN_TANNERY_PRESET_DATA.columns.map((c, cIdx) => {
+      const items: DetectedNumberItem[] = c.values.map((v, vIdx) => ({
+        id: `tannery-col${cIdx + 1}-item${vIdx + 1}`,
+        value: v,
+        rawText: v.toString(),
+        columnIndex: cIdx,
+        label: `P${vIdx + 1}`,
+      }));
+      const safe = computeSafeSum(items);
+      return {
+        id: `col-${cIdx + 1}`,
+        title: c.title,
+        items,
+        sum: safe.sum,
+        formula: safe.formula,
+        maxDecimals: safe.maxDecimals,
+      };
+    });
+
+    const allItems = cols.flatMap((c) => c.items);
+    const colSums = cols.map((c) => c.sum);
+    const grand = computeSafeSum(colSums);
+
+    return {
+      success: true,
+      detectedTitle: "EVERWIN TANNERS - MELVISHARAM (MEASUREMENT LIST)",
+      notes: "Full-page multi-column measurement list with 8 vertical columns across 3 sections.",
+      items: allItems,
+      sum: grand.sum,
+      formula: grand.formula,
+      count: allItems.length,
+      maxDecimals: grand.maxDecimals,
+      columns: cols,
+      grandTotal: grand.sum,
+      grandFormula: colSums.join(" + ") + " = " + grand.sum,
+      totalNumbersCount: allItems.length,
+      isMeasurementChart: true,
+      measurementMetadata: {
+        isMeasurementChart: true,
+        companyName: "EVERWIN TANNERS - MELVISHARAM",
+        documentTitle: "MEASUREMENT LIST",
+        date: "21/9/06",
+        article: "Buff Calf Finished",
+        totalPieces: 214,
+        totalSqFt: 4475.0,
+        averageSqFt: 20.91,
+        unit: "Sq. Ft.",
+      },
+    };
+  }
+
+  if (presetName === "example-33-32") {
+    const items: DetectedNumberItem[] = [
+      { id: "item-1", value: 33.3, rawText: "33.3", label: "Item 1", columnIndex: 0 },
+      { id: "item-2", value: 32.2, rawText: "32.2", label: "Item 2", columnIndex: 0 },
+    ];
+    const safe = computeSafeSum(items);
+    const col: VerticalColumnLine = {
+      id: "col-1",
+      title: "Vertical Column",
+      items,
+      sum: safe.sum,
+      formula: safe.formula,
+      maxDecimals: safe.maxDecimals,
+    };
+    return {
+      success: true,
+      detectedTitle: "Vertical Addition (33.3 + 32.2)",
+      notes: "Sample verified vertical addition with decimals.",
+      items,
+      sum: safe.sum,
+      formula: safe.formula,
+      count: 2,
+      maxDecimals: safe.maxDecimals,
+      columns: [col],
+      grandTotal: safe.sum,
+      grandFormula: safe.formula,
+      totalNumbersCount: 2,
+    };
+  }
+
+  if (presetName === "multi-vertical-lines") {
+    const col1Items: DetectedNumberItem[] = [
+      { id: "c1-1", value: 45.5, rawText: "45.5", columnIndex: 0 },
+      { id: "c1-2", value: 120.0, rawText: "120.0", columnIndex: 0 },
+      { id: "c1-3", value: 84.5, rawText: "84.5", columnIndex: 0 },
+    ];
+    const col2Items: DetectedNumberItem[] = [
+      { id: "c2-1", value: 310.25, rawText: "310.25", columnIndex: 1 },
+      { id: "c2-2", value: 95.75, rawText: "95.75", columnIndex: 1 },
+      { id: "c2-3", value: 144.0, rawText: "144.0", columnIndex: 1 },
+    ];
+    const s1 = computeSafeSum(col1Items);
+    const s2 = computeSafeSum(col2Items);
+    const col1: VerticalColumnLine = { id: "col-1", title: "Batch 1", items: col1Items, sum: s1.sum, formula: s1.formula, maxDecimals: s1.maxDecimals };
+    const col2: VerticalColumnLine = { id: "col-2", title: "Batch 2", items: col2Items, sum: s2.sum, formula: s2.formula, maxDecimals: s2.maxDecimals };
+    const grand = computeSafeSum([s1.sum, s2.sum]);
+
+    return {
+      success: true,
+      detectedTitle: "2 Vertical Lines Addition",
+      notes: "Multi-column vertical summation test.",
+      items: [...col1Items, ...col2Items],
+      sum: grand.sum,
+      formula: grand.formula,
+      count: 6,
+      maxDecimals: grand.maxDecimals,
+      columns: [col1, col2],
+      grandTotal: grand.sum,
+      grandFormula: `${s1.sum} + ${s2.sum} = ${grand.sum}`,
+      totalNumbersCount: 6,
+    };
+  }
+
+  if (presetName === "receipt-4-items") {
+    const items: DetectedNumberItem[] = [
+      { id: "r-1", value: 12.5, rawText: "12.50", label: "Item 1", columnIndex: 0 },
+      { id: "r-2", value: 45.0, rawText: "45.00", label: "Item 2", columnIndex: 0 },
+      { id: "r-3", value: 8.25, rawText: "8.25", label: "Item 3", columnIndex: 0 },
+      { id: "r-4", value: 14.25, rawText: "14.25", label: "Item 4", columnIndex: 0 },
+    ];
+    const safe = computeSafeSum(items);
+    const col: VerticalColumnLine = { id: "col-1", title: "Receipt Column", items, sum: safe.sum, formula: safe.formula, maxDecimals: safe.maxDecimals };
+    return {
+      success: true,
+      detectedTitle: "Receipt Column Sum",
+      notes: "Grocery receipt column addition.",
+      items,
+      sum: safe.sum,
+      formula: safe.formula,
+      count: 4,
+      maxDecimals: safe.maxDecimals,
+      columns: [col],
+      grandTotal: safe.sum,
+      grandFormula: safe.formula,
+      totalNumbersCount: 4,
+    };
+  }
+
+  // Default ledger sample
+  const items: DetectedNumberItem[] = [
+    { id: "l-1", value: 105.4, rawText: "105.4", label: "Account A", columnIndex: 0 },
+    { id: "l-2", value: 210.6, rawText: "210.6", label: "Account B", columnIndex: 0 },
+  ];
+  const safe = computeSafeSum(items);
+  const col: VerticalColumnLine = { id: "col-1", title: "Ledger", items, sum: safe.sum, formula: safe.formula, maxDecimals: safe.maxDecimals };
+  return {
+    success: true,
+    detectedTitle: "Ledger Account Sum",
+    notes: "Ledger entries calculation.",
+    items,
+    sum: safe.sum,
+    formula: safe.formula,
+    count: 2,
+    maxDecimals: safe.maxDecimals,
+    columns: [col],
+    grandTotal: safe.sum,
+    grandFormula: safe.formula,
+    totalNumbersCount: 2,
+  };
 }

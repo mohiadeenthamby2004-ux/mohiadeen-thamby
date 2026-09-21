@@ -202,7 +202,8 @@ import java.util.Locale;
 
 public class MainActivity extends AppCompatActivity {
 
-    private static final String APP_URL = "https://ais-pre-r6w7sigcxwp7vzj2y2b3l7-750761806589.asia-southeast1.run.app";
+    // Loads the complete offline application directly from embedded APK assets
+    private static final String APP_URL = "file:///android_asset/index.html?mode=standalone&storage=local&build=v1.0.0";
 
     private WebView webView;
     private SwipeRefreshLayout swipeRefresh;
@@ -419,6 +420,14 @@ for folder in ["mipmap-hdpi", "mipmap-xhdpi", "mipmap-xxhdpi", "mipmap-xxxhdpi"]
     dest = os.path.join(OUTPUT_DIR, "app/src/main/res", folder, "ic_launcher.png")
     if os.path.exists(icon192):
         shutil.copyfile(icon192, dest)
+
+# Copy standalone web app into assets
+assets_dir = os.path.join(OUTPUT_DIR, "app/src/main/assets")
+os.makedirs(assets_dir, exist_ok=True)
+standalone_html = os.path.abspath("dist-standalone/index.html")
+if os.path.exists(standalone_html):
+    shutil.copyfile(standalone_html, os.path.join(assets_dir, "index.html"))
+    print(f"Copied standalone index.html ({os.path.getsize(standalone_html)} bytes) to Android assets")
 
 # 9. README.md with build instructions
 with open(os.path.join(OUTPUT_DIR, "README.md"), "w") as f:

@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI, Type, ThinkingLevel } from "@google/genai";
 
 const app = express();
 const PORT = 3000;
@@ -11,8 +11,33 @@ const PORT = 3000;
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
 
-// Helper to get safe decimal precision and sum
-function calculatePreciseSum(numbers: number[]): { sum: number; formula: string; maxDecimals: number } {
+// Helper function applying domain rule:
+// "When performing addition, any 3-digit number should have a decimal point placed after the first two digits (e.g., assume 333 as 33.3)."
+function normalize3DigitValue(val: number | string | null | undefined): number {
+  if (val == null) return 0;
+  if (typeof val === "string") {
+    const trimmed = val.trim().replace(/,/g, "").replace(/-$/, "");
+    if (/^[+-]?\d{3}$/.test(trimmed)) {
+      const parsedInt = parseInt(trimmed, 10);
+      return Number((parsedInt / 10).toFixed(1));
+    }
+    const parsedFloat = parseFloat(trimmed);
+    if (isNaN(parsedFloat)) return 0;
+    val = parsedFloat;
+  }
+  if (typeof val === "number" && !isNaN(val)) {
+    const absVal = Math.abs(val);
+    if (Number.isInteger(val) && absVal >= 100 && absVal <= 999) {
+      return Number((val / 10).toFixed(1));
+    }
+    return val;
+  }
+  return 0;
+}
+
+// Helper to get safe decimal precision and sum (normalizing any 3-digit number e.g. 333 -> 33.3)
+function calculatePreciseSum(rawNumbers: (number | string)[]): { sum: number; formula: string; maxDecimals: number } {
+  const numbers = rawNumbers.map(normalize3DigitValue).filter((n) => !isNaN(n));
   if (numbers.length === 0) {
     return { sum: 0, formula: "0", maxDecimals: 0 };
   }
@@ -34,13 +59,24 @@ function calculatePreciseSum(numbers: number[]): { sum: number; formula: string;
   return { sum, formula, maxDecimals };
 }
 
+// Helper to chunk items evenly across multiple columns
+function chunkListEvenly<T>(items: T[], numCols: number): T[][] {
+  const result: T[][] = Array.from({ length: numCols }, () => []);
+  const itemsPerCol = Math.ceil(items.length / numCols);
+  for (let i = 0; i < items.length; i++) {
+    const colIdx = Math.min(Math.floor(i / itemsPerCol), numCols - 1);
+    result[colIdx].push(items[i]);
+  }
+  return result.filter((col) => col.length > 0);
+}
+
 // Health check endpoint
 app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", service: "Photo Addition Calculator" });
+  res.json({ status: "ok", service: "Measurement Chart" });
 });
 
 /**
- * Execute Gemini call with retry on 503/429 and fallback to secondary models
+ * Execute Gemini call with fallback to secondary models on 503/429 high demand or timeouts
  */
 async function callGeminiWithFallback(
   ai: GoogleGenAI,
@@ -48,56 +84,60 @@ async function callGeminiWithFallback(
   textPart: any,
   responseSchema: any
 ) {
-  // Use gemini-3.6-flash as primary (officially recommended & high availability),
-  // followed by gemini-3.1-flash-lite, gemini-3.8-flash, and gemini-flash-latest
+  // Candidate models prioritized for ultra-low latency OCR with minimal reasoning overhead
   const candidateModels = [
-    "gemini-3.6-flash",
-    "gemini-3.1-flash-lite",
-    "gemini-3.8-flash",
-    "gemini-flash-latest",
+    { name: "gemini-3.1-flash-lite", thinking: ThinkingLevel.MINIMAL, timeoutMs: 24000 },
+    { name: "gemini-3.6-flash", thinking: ThinkingLevel.LOW, timeoutMs: 24000 },
+    { name: "gemini-3.8-flash", thinking: ThinkingLevel.LOW, timeoutMs: 18000 },
   ];
   let lastError: any = null;
 
-  for (const model of candidateModels) {
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const response = await ai.models.generateContent({
-          model,
-          contents: { parts: [imagePart, textPart] },
-          config: {
-            responseMimeType: "application/json",
-            responseSchema,
-          },
-        });
-        return { response, modelUsed: model };
-      } catch (err: any) {
-        lastError = err;
-        const msg = String(err?.message || "").toLowerCase();
-        const code = err?.status || err?.code || 0;
-        const isTemporary =
-          code === 503 ||
-          code === 429 ||
-          msg.includes("503") ||
-          msg.includes("high demand") ||
-          msg.includes("spikes in demand") ||
-          msg.includes("unavailable") ||
-          msg.includes("resource_exhausted");
+  for (const candidate of candidateModels) {
+    const { name: model, thinking, timeoutMs } = candidate;
+    try {
+      console.log(`[Gemini API] Requesting document OCR with model: ${model} (timeout: ${timeoutMs / 1000}s)...`);
+      const generatePromise = ai.models.generateContent({
+        model,
+        contents: { parts: [imagePart, textPart] },
+        config: {
+          responseMimeType: "application/json",
+          responseSchema,
+          thinkingConfig: { thinkingLevel: thinking },
+        },
+      });
 
-        const isNotFound = code === 404 || msg.includes("404") || msg.includes("no longer available");
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(
+          () => reject(new Error(`Model ${model} request timed out after ${Math.round(timeoutMs / 1000)}s`)),
+          timeoutMs
+        );
+      });
 
-        if (isNotFound) {
-          console.warn(`[Gemini API] Model ${model} is not available (404). Skipping directly to next model.`);
-          break; // Don't retry attempt 2 if model is not found
-        } else if (isTemporary) {
-          console.warn(
-            `[Gemini API] Model ${model} (attempt ${attempt}) temporary error: ${err.message}. Retrying or switching model...`
-          );
-          // Brief exponential backoff
-          await new Promise((r) => setTimeout(r, attempt * 600));
-        } else {
-          console.warn(`[Gemini API] Model ${model} error: ${err.message}`);
-          break;
-        }
+      const response = await Promise.race([generatePromise, timeoutPromise]);
+      console.log(`[Gemini API] Successfully analyzed with ${model}`);
+      return { response, modelUsed: model };
+    } catch (err: any) {
+      lastError = err;
+      const msg = String(err?.message || "").toLowerCase();
+      const code = err?.status || err?.code || 0;
+      const isTemporary =
+        code === 503 ||
+        code === 429 ||
+        msg.includes("503") ||
+        msg.includes("high demand") ||
+        msg.includes("spikes in demand") ||
+        msg.includes("unavailable") ||
+        msg.includes("resource_exhausted") ||
+        msg.includes("timed out");
+
+      const isNotFound = code === 404 || msg.includes("404") || msg.includes("no longer available");
+
+      if (isNotFound) {
+        console.log(`[Gemini API] Model ${model} is not available (404). Falling back to next candidate model...`);
+      } else if (isTemporary) {
+        console.log(`[Gemini API] Model ${model} is currently busy/unavailable (${code || 'temporary'}). Gracefully switching to next candidate model...`);
+      } else {
+        console.log(`[Gemini API] Model ${model} encountered an issue: ${err.message}. Trying next candidate model...`);
       }
     }
   }
@@ -182,7 +222,7 @@ app.post("/api/calculate-photo", async (req, res) => {
       const calculatedCols = manualColumns.map((col: any, colIdx: number) => {
         const rawItems = Array.isArray(col.items) ? col.items : [];
         const numericValues = rawItems
-          .map((v: any) => (typeof v.value === "number" ? v.value : parseFloat(v.value || v.rawText)))
+          .map((v: any) => normalize3DigitValue(v.value ?? v.rawText))
           .filter((n: number) => !isNaN(n));
 
         const { sum: colSum, formula: colFormula, maxDecimals: colDecimals } = calculatePreciseSum(numericValues);
@@ -190,14 +230,17 @@ app.post("/api/calculate-photo", async (req, res) => {
         return {
           id: col.id || `col-${colIdx}-${Date.now()}`,
           title: col.title || `Line ${colIdx + 1}`,
-          items: rawItems.map((it: any, itemIdx: number) => ({
-            id: it.id || `manual-item-${colIdx}-${itemIdx}`,
-            value: typeof it.value === "number" && !isNaN(it.value) ? it.value : parseFloat(it.value) || 0,
-            rawText: it.rawText || String(it.value),
-            label: it.label || `Value ${itemIdx + 1}`,
-            columnIndex: colIdx,
-            box_2d: it.box_2d || null,
-          })),
+          items: rawItems.map((it: any, itemIdx: number) => {
+            const val = normalize3DigitValue(it.value ?? it.rawText);
+            return {
+              id: it.id || `manual-item-${colIdx}-${itemIdx}`,
+              value: val,
+              rawText: it.rawText || String(val),
+              label: it.label || `Value ${itemIdx + 1}`,
+              columnIndex: colIdx,
+              box_2d: it.box_2d || null,
+            };
+          }),
           sum: colSum,
           formula: colFormula,
           maxDecimals: colDecimals,
@@ -227,7 +270,7 @@ app.post("/api/calculate-photo", async (req, res) => {
 
     if (manualValues && Array.isArray(manualValues)) {
       const numericValues = manualValues
-        .map((v: any) => (typeof v === "number" ? v : parseFloat(v)))
+        .map((v: any) => normalize3DigitValue(v))
         .filter((n: number) => !isNaN(n));
 
       const { sum, formula, maxDecimals } = calculatePreciseSum(numericValues);
@@ -281,36 +324,13 @@ app.post("/api/calculate-photo", async (req, res) => {
 
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
-      console.warn("GEMINI_API_KEY not configured. Falling back to demo mode.");
-      const fallbackValues = [33.3, 32.2];
-      const { sum, formula, maxDecimals } = calculatePreciseSum(fallbackValues);
-      const fallbackItems = [
-        { id: "item-0", value: 33.3, rawText: "33.3", label: "Line 1", columnIndex: 0 },
-        { id: "item-1", value: 32.2, rawText: "32.2", label: "Line 2", columnIndex: 0 },
-      ];
-      const fallbackCol = {
-        id: "col-0",
-        title: "Vertical Line 1",
-        items: fallbackItems,
-        sum,
-        formula,
-        maxDecimals,
-      };
-
-      return res.json({
-        success: true,
-        columns: [fallbackCol],
-        grandTotal: sum,
-        grandFormula: formula,
-        items: fallbackItems,
-        sum,
-        formula,
-        count: fallbackValues.length,
-        totalNumbersCount: fallbackValues.length,
-        maxDecimals,
-        source: "demo_fallback",
-        detectedTitle: "Vertical Column Addition",
-        notes: "Processed sample (33.3 + 32.2 = 65.5). Configure GEMINI_API_KEY in settings to analyze custom live photos.",
+      console.warn("GEMINI_API_KEY not configured.");
+      return res.status(400).json({
+        success: false,
+        error: "GEMINI_API_KEY is not configured in server environment. Please enter numbers into the table manually or configure GEMINI_API_KEY in Settings.",
+        columns: [],
+        items: [],
+        sum: 0,
       });
     }
 
@@ -325,33 +345,31 @@ app.post("/api/calculate-photo", async (req, res) => {
 
     const promptText = `
 You are an expert document OCR and industrial measurement calculation specialist.
-The user provided a photo of a document. It may be:
-- A FULL-PAGE MEASUREMENT CHART / TALLY SHEET (such as EVERWIN TANNERS, Leather / Hides measurement list, timber tally, textile roll list, or warehouse inventory sheet).
-- A multi-column columnar ledger with up to 8-10 or more columns and up to 30 or more rows per column.
-- Or a single/multi-column vertical arithmetic sheet or receipt.
+The user provided a photo of a document or handwritten sheet to calculate.
 
-SPECIAL INSTRUCTIONS FOR MEASUREMENT CHARTS & TANNERY LISTS:
-1. Document Structure & Header:
-   - Identify header information if present (e.g. Company name "EVERWIN TANNERS - MELVISHARAM", "MEASUREMENT LIST", Date "21/9/06", Article, etc.) as 'detectedTitle'.
-   - Determine if this is a measurement chart (set isMeasurementChart: true).
-2. Industrial & Tannery Shorthand:
-   - In leather, timber, and tally charts, WHOLE NUMBERS often end with a hyphen/dash instead of .0!
-     For example: "25-" means 25.0, "21-" means 21.0, "18-" means 18.0, "24-" means 24.0, "20-" means 20.0, "22-" means 22.0, "14-" means 14.0, "17-" means 17.0, "23-" means 23.0.
-     Convert these trailing dashes into proper .0 decimals (e.g. 25.0).
+CRITICAL DIRECTIVES:
+1. STRICT FACTUAL EXTRACTION ONLY:
+   - Extract ONLY the actual, distinct numbers that are clearly visible in this specific uploaded image.
+   - DO NOT hallucinate, extrapolate, or invent numbers that are not written on the page.
+   - If the image has NO clear or readable numbers, return an empty columns array: "columns": [].
+   - Never output generic sample numbers like 1, 2, 3... 20 or arbitrary demo numbers.
+
+2. MULTI-COLUMN SEPARATION REQUIREMENT (EXTREMELY CRITICAL):
+   - Photos of measurement lists, tally charts, ledger sheets, and vertical additions almost ALWAYS feature MULTIPLE VERTICAL COLUMNS arranged side-by-side horizontally (e.g., 2, 3, 4, 5, 8, or 10 vertical columns).
+   - YOU MUST OUTPUT EACH VERTICAL COLUMN AS A SEPARATE OBJECT in the "columns" array (e.g. "Column 1", "Column 2", "Column 3", "Column 4"...) in left-to-right order!
+   - NEVER combine, merge, or concatenate all numbers across the page into a single column. If there are multiple columns side-by-side, separate them strictly into their respective vertical columns!
+   - For each column, list its numbers strictly from top to bottom.
+
+3. SPECIAL INSTRUCTIONS FOR MEASUREMENT CHARTS & TANNERY LISTS:
+   - RULE FOR 3-DIGIT NUMBERS (CRITICAL): When performing addition, any 3-digit number should have a decimal point placed after the first two digits (e.g., assume 333 as 33.3, 322 as 32.2, 180 as 18.0, 245 as 24.5). If a whole number has 3 digits without an explicit decimal point, record its numeric value with the decimal point after the first two digits (e.g., 333 -> 33.3).
+   - Shorthand Whole Numbers: In leather and tally sheets, whole numbers often end with a trailing hyphen/dash instead of .0 (e.g., "25-" means 25.0, "21-" means 21.0, "18-" means 18.0, "24-" means 24.0, "20-" means 20.0, "22-" means 22.0). Convert these trailing dashes into proper .0 decimals (e.g. 25.0).
    - Decimal numbers like "24.4", "20.2", "23.8", "18.7", "22.5" should be preserved with their exact decimal values.
-3. Row Index / Serial Number Exclusion:
-   - The far-left column (numbers 1, 2, 3, 4, 5 ... up to 30) are ROW NUMBERS / SERIAL NUMBERS indicating line indices.
-   - CRITICAL: DO NOT treat the row index column (1..30) as measurement values! They must NOT be added into the sums. Only read the actual measurement data columns.
-4. Multi-Column Reading:
-   - Measure each vertical column from top to bottom (row 1 to row 30).
-   - Group them in left-to-right order:
-     E.g., Section 1: Col 1, Col 2; Section 2: Col 3, Col 4, Col 5, Col 6; Section 3: Col 7, Col 8.
-   - Title each column clearly: "Section 1 - Col 1", "Section 1 - Col 2", etc., or "Column 1", "Column 2".
-   - Assign labels to numbers indicating their row (e.g., "Row 1", "Row 2", ... "Row 30").
-5. Footer Summary / Written Totals:
-   - If the bottom of the sheet has written totals or summary cells (e.g. "Total Hides / Sides", "Total Sq Ft", "T. Hides", "T. Sq Ft", or individual column totals), record any visible written sums in 'existingWrittenSum' or describe them in 'notes'.
-6. Precise Bounding Boxes:
-   - Provide bounding box coordinates [ymin, xmin, ymax, xmax] on a 0-1000 scale for each detected number.
+   - Row Index / Serial Number Exclusion: Far-left row numbers (1, 2, 3... 30) indicating row indices must NOT be included in calculations. Only extract actual measurement values.
+   - Column organization: Preserve left-to-right columns and top-to-bottom number order.
+   - If header has company or article name, record as detectedTitle.
+
+4. FAST OCR DIRECTIVE:
+   - Prioritize quick, accurate digit and decimal reading for each vertical column from top to bottom.
 `;
 
     const imagePart = {
@@ -424,13 +442,6 @@ SPECIAL INSTRUCTIONS FOR MEASUREMENT CHARTS & TANNERY LISTS:
                       type: Type.STRING,
                       description: "Accompanying line label or item description if present",
                     },
-                    box_2d: {
-                      type: Type.ARRAY,
-                      description: "[ymin, xmin, ymax, xmax] on a 0-1000 scale",
-                      items: {
-                        type: Type.NUMBER,
-                      },
-                    },
                   },
                   required: ["value", "rawText"],
                 },
@@ -467,14 +478,18 @@ SPECIAL INSTRUCTIONS FOR MEASUREMENT CHARTS & TANNERY LISTS:
       .map((col: any, colIndex: number) => {
         const rawNumbers = Array.isArray(col.numbers) ? col.numbers : [];
         const sanitizedItems = rawNumbers
-          .filter((item: any) => typeof item.value === "number" && !isNaN(item.value))
           .map((item: any, itemIndex: number) => {
-            let numVal = Number(item.value);
+            let numVal = typeof item.value === "number" ? item.value : parseFloat(String(item.value ?? item.rawText ?? "").replace(/,/g, ""));
             // If raw text ends with dash like '25-', ensure it is integer
-            const rawStr = String(item.rawText || "");
+            const rawStr = String(item.rawText || item.value || "");
             if (rawStr.endsWith("-") && !isNaN(parseFloat(rawStr.slice(0, -1)))) {
               numVal = parseFloat(rawStr.slice(0, -1));
             }
+            if (isNaN(numVal)) return null;
+
+            // Apply specification rule: any 3-digit number has decimal placed after first two digits (e.g. 333 -> 33.3)
+            numVal = normalize3DigitValue(numVal);
+
             return {
               id: `detected-c${colIndex}-i${itemIndex}-${Date.now()}`,
               value: numVal,
@@ -483,7 +498,8 @@ SPECIAL INSTRUCTIONS FOR MEASUREMENT CHARTS & TANNERY LISTS:
               columnIndex: colIndex,
               box_2d: Array.isArray(item.box_2d) && item.box_2d.length === 4 ? item.box_2d : null,
             };
-          });
+          })
+          .filter(Boolean);
 
         if (sanitizedItems.length === 0) return null;
 
@@ -512,14 +528,85 @@ SPECIAL INSTRUCTIONS FOR MEASUREMENT CHARTS & TANNERY LISTS:
       });
     }
 
+    // Auto-partition into multiple columns if single column is returned but contains multi-column data
+    let finalColumns = sanitizedColumns;
+    if (sanitizedColumns.length === 1 && sanitizedColumns[0].items.length >= 6) {
+      const items = sanitizedColumns[0].items;
+      const itemsWithBoxes = items.filter((it: any) => Array.isArray(it.box_2d) && it.box_2d.length === 4);
+
+      let shouldSplit = false;
+      let targetCols = 4;
+
+      if (itemsWithBoxes.length >= 4) {
+        const xPositions = itemsWithBoxes.map((it: any) => (it.box_2d[1] + it.box_2d[3]) / 2);
+        const minX = Math.min(...xPositions);
+        const maxX = Math.max(...xPositions);
+        // If x positions span more than 20% of page width, it's a multi-column document
+        if (maxX - minX >= 200) {
+          shouldSplit = true;
+          targetCols = Math.max(2, Math.min(Math.round((maxX - minX) / 120), 8));
+        }
+      } else if (items.length >= 16 || parsed.isMeasurementChart) {
+        shouldSplit = true;
+        targetCols = items.length >= 32 ? 8 : (items.length >= 16 ? 4 : 2);
+      }
+
+      if (shouldSplit) {
+        let buckets: any[][] = Array.from({ length: targetCols }, () => []);
+        if (itemsWithBoxes.length >= 4) {
+          const xPositions = items.map((it: any) =>
+            Array.isArray(it.box_2d) && it.box_2d.length === 4 ? (it.box_2d[1] + it.box_2d[3]) / 2 : 500
+          );
+          const minX = Math.min(...xPositions);
+          const maxX = Math.max(...xPositions);
+          const range = Math.max(maxX - minX, 20);
+
+          items.forEach((it: any) => {
+            const x = Array.isArray(it.box_2d) && it.box_2d.length === 4 ? (it.box_2d[1] + it.box_2d[3]) / 2 : minX;
+            let bIdx = Math.floor(((x - minX) / range) * targetCols);
+            if (bIdx >= targetCols) bIdx = targetCols - 1;
+            if (bIdx < 0) bIdx = 0;
+            buckets[bIdx].push(it);
+          });
+        }
+
+        const nonEmpty = buckets.filter((b) => b.length > 0);
+        const validBuckets = nonEmpty.length >= 2 ? nonEmpty : chunkListEvenly(items, targetCols);
+
+        finalColumns = validBuckets.map((bucketItems, colIdx) => {
+          bucketItems.sort((a: any, b: any) => {
+            const ya = Array.isArray(a.box_2d) && a.box_2d.length === 4 ? a.box_2d[0] : 0;
+            const yb = Array.isArray(b.box_2d) && b.box_2d.length === 4 ? b.box_2d[0] : 0;
+            return ya - yb;
+          });
+          const { sum: colSum, formula: colFormula, maxDecimals: colDecimals } = calculatePreciseSum(
+            bucketItems.map((it: any) => it.value)
+          );
+          return {
+            id: `col-${colIdx + 1}-${Date.now()}`,
+            title: `Column ${colIdx + 1}`,
+            items: bucketItems.map((it: any, rIdx: number) => ({
+              ...it,
+              columnIndex: colIdx,
+              label: `Row ${rIdx + 1}`,
+            })),
+            sum: colSum,
+            formula: colFormula,
+            maxDecimals: colDecimals,
+            existingWrittenSum: null,
+          };
+        });
+      }
+    }
+
     // Compute grand total across all vertical lines
-    const columnSums = sanitizedColumns.map((c: any) => c.sum);
+    const columnSums = finalColumns.map((c: any) => c.sum);
     const { sum: grandTotal, formula: grandFormula } = calculatePreciseSum(columnSums);
-    const allItems = sanitizedColumns.flatMap((c: any) => c.items);
+    const allItems = finalColumns.flatMap((c: any) => c.items);
     const { maxDecimals: overallMaxDecimals } = calculatePreciseSum(allItems.map((it: any) => it.value));
 
     // Calculate measurement metadata if detected or multiple columns present
-    const isChart = Boolean(parsed.isMeasurementChart || sanitizedColumns.length >= 4);
+    const isChart = Boolean(parsed.isMeasurementChart || finalColumns.length >= 4);
     const totalPieces = allItems.length;
     const averageSqFt = totalPieces > 0 ? Number((grandTotal / totalPieces).toFixed(2)) : 0;
 
@@ -537,19 +624,19 @@ SPECIAL INSTRUCTIONS FOR MEASUREMENT CHARTS & TANNERY LISTS:
 
     return res.json({
       success: true,
-      columns: sanitizedColumns,
+      columns: finalColumns,
       grandTotal,
       grandFormula,
       totalNumbersCount: allItems.length,
       // For backwards-compatibility with single-column components:
       items: allItems,
-      sum: sanitizedColumns.length === 1 ? sanitizedColumns[0].sum : grandTotal,
-      formula: sanitizedColumns.length === 1 ? sanitizedColumns[0].formula : grandFormula,
+      sum: finalColumns.length === 1 ? finalColumns[0].sum : grandTotal,
+      formula: finalColumns.length === 1 ? finalColumns[0].formula : grandFormula,
       count: allItems.length,
       maxDecimals: overallMaxDecimals,
-      detectedTitle: parsed.detectedTitle || (isChart ? "Full Page Measurement Chart" : (sanitizedColumns.length > 1 ? "Multiple Vertical Lines Addition" : "Vertical Column Addition")),
-      notes: parsed.notes || `Detected ${sanitizedColumns.length} vertical column(s) with ${allItems.length} measurement entries`,
-      existingWrittenSum: sanitizedColumns.length === 1 ? sanitizedColumns[0].existingWrittenSum : null,
+      detectedTitle: parsed.detectedTitle || (isChart ? "Full Page Measurement Chart" : (finalColumns.length > 1 ? "Multiple Vertical Lines Addition" : "Vertical Column Addition")),
+      notes: parsed.notes || `Detected ${finalColumns.length} vertical column(s) with ${allItems.length} measurement entries`,
+      existingWrittenSum: finalColumns.length === 1 ? finalColumns[0].existingWrittenSum : null,
       isMeasurementChart: isChart,
       measurementMetadata: isChart ? measurementMetadata : undefined,
       source: "gemini",
@@ -572,6 +659,8 @@ SPECIAL INSTRUCTIONS FOR MEASUREMENT CHARTS & TANNERY LISTS:
       userFriendlyMessage = "Gemini API key is invalid or not configured. Please check your settings.";
     } else if (rawMsg.includes("quota") || rawMsg.includes("429")) {
       userFriendlyMessage = "API rate limit exceeded. Please wait a few seconds and try again.";
+    } else if (rawMsg.toLowerCase().includes("timed out") || rawMsg.toLowerCase().includes("timeout")) {
+      userFriendlyMessage = "Document analysis timed out due to high document complexity or temporary network delay. Your photo remains displayed — you can retry scanning or enter your numbers directly into the table.";
     } else {
       userFriendlyMessage = rawMsg.replace(/ApiError:\s*/, "").replace(/\{"error":\{.*"message":"([^"]+)".*\}\}/, "$1") || userFriendlyMessage;
     }
@@ -594,7 +683,10 @@ async function startServer() {
   // Vite middleware in development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR === "true" ? false : undefined,
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);
@@ -607,7 +699,7 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Photo Addition Calculator server running on http://localhost:${PORT}`);
+    console.log(`Measurement Chart server running on http://localhost:${PORT}`);
   });
 }
 

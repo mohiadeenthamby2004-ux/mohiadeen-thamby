@@ -1,6 +1,6 @@
 {
-  "name": "Photo Addition Calculator",
-  "description": "Scan or take a photo of vertically listed numbers to automatically calculate single or multi-column sums, with editable session notes, current date stamping, and PDF/Excel export.",
+  "name": "Measurement Chart",
+  "description": "Scan or snap photos of measurement charts, tannery tally sheets, waybills, and vertical number columns with offline arithmetic, editable matrix, and PDF/Excel export.",
   "requestFramePermissions": [
     "camera"
   ],

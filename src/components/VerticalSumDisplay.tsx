@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import { DetectedNumberItem, VerticalColumnLine, MeasurementMetadata } from "../types";
 import {
   Copy,
@@ -16,11 +16,32 @@ import {
   Grid,
   Layers,
   Building2,
+  Eye,
+  Download,
+  BarChart3,
+  SlidersHorizontal,
+  Table,
 } from "lucide-react";
-import { formatVerticalColumn, computeSafeSum } from "../utils/math";
+import {
+  formatVerticalColumn,
+  computeSafeSum,
+  formatDisplayNumber,
+  normalize3DigitValue,
+  formatNormalizedInputHint,
+  partitionIntoMultipleColumns,
+  calculateColumnSummaries,
+} from "../utils/math";
 import { shareCalculation } from "../utils/share";
-import { exportToPdf, exportToExcel, formatCurrentDateTime } from "../utils/export";
+import {
+  exportToPdf,
+  exportToExcel,
+  sharePdfFile,
+  shareExcelFile,
+  previewPdf,
+  formatCurrentDateTime,
+} from "../utils/export";
 import { MeasurementChartMatrix } from "./MeasurementChartMatrix";
+import { AnimatedGrandTotal } from "./AnimatedGrandTotal";
 
 interface VerticalSumDisplayProps {
   items: DetectedNumberItem[];
@@ -42,6 +63,7 @@ interface VerticalSumDisplayProps {
   hoveredItemId: string | null;
   onHoverItem: (id: string | null) => void;
   onExportSuccess?: (msg: string) => void;
+  onOpenShareModal?: (format: "pdf" | "excel") => void;
 }
 
 export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
@@ -63,6 +85,7 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
   hoveredItemId,
   onHoverItem,
   onExportSuccess,
+  onOpenShareModal,
 }) => {
   const isFullPageMeasurementChart = Boolean(
     isMeasurementChart ||
@@ -70,14 +93,72 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
     (columns && columns.length >= 4)
   );
 
-  const [matrixViewMode, setMatrixViewMode] = useState<"matrix" | "cards">(
-    isFullPageMeasurementChart ? "matrix" : "cards"
-  );
+  // Active columns: use columns if multiple; otherwise partition items into multiple columns
+  const activeColumns = useMemo<VerticalColumnLine[]>(() => {
+    if (Array.isArray(columns) && columns.length > 1) {
+      return columns;
+    }
+    const allItems = items && items.length > 0 ? items : (columns && columns[0] ? columns[0].items : []);
+    if (allItems.length >= 4) {
+      const targetColCount = allItems.length >= 24 ? 8 : (allItems.length >= 10 ? 4 : 2);
+      return partitionIntoMultipleColumns(allItems, targetColCount);
+    }
+    if (columns && columns.length === 1) {
+      return columns;
+    }
+    if (allItems.length > 0) {
+      const { sum: colSum, formula: colFormula, maxDecimals: colDecimals } = computeSafeSum(allItems);
+      return [
+        {
+          id: "col-1",
+          title: "Column 1",
+          items: allItems,
+          sum: colSum,
+          formula: colFormula,
+          maxDecimals: colDecimals,
+        },
+      ];
+    }
+    return [];
+  }, [columns, items]);
+
+  const isMultiColumn = activeColumns.length > 1;
+  const effectiveGrandTotal = grandTotal ?? computeSafeSum(activeColumns.map((c) => c.sum)).sum;
+  const effectiveGrandFormula = grandFormula || activeColumns.map((c) => `${c.title} (${c.sum})`).join(" + ");
+
+  const summaryData = useMemo(() => {
+    return calculateColumnSummaries(activeColumns, effectiveGrandTotal);
+  }, [activeColumns, effectiveGrandTotal]);
+
+  // Default view is "summary" (summarised only with multiple columns)
+  const [matrixViewMode, setMatrixViewMode] = useState<"summary" | "matrix" | "cards">("summary");
+
+  // Keep parent columns state in sync if activeColumns partitioned into multiple columns
+  useEffect(() => {
+    if ((!columns || columns.length <= 1) && activeColumns.length > 1 && onUpdateColumns) {
+      onUpdateColumns(activeColumns);
+    }
+  }, [columns, activeColumns, onUpdateColumns]);
+
+  const handleSplitColumns = (targetCount: number) => {
+    const allItems = items && items.length > 0 ? items : activeColumns.flatMap((c) => c.items);
+    if (allItems.length === 0) return;
+    const newCols = partitionIntoMultipleColumns(allItems, targetCount);
+    if (onUpdateColumns) {
+      onUpdateColumns(newCols);
+    }
+    if (onExportSuccess) {
+      onExportSuccess(`Result changed to ${newCols.length} multiple columns`);
+    }
+  };
+
   const [copied, setCopied] = useState<boolean>(false);
   const [shareFeedback, setShareFeedback] = useState<string | null>(null);
   const [isSharing, setIsSharing] = useState<boolean>(false);
   const [isExportingPdf, setIsExportingPdf] = useState<boolean>(false);
+  const [isSharingPdf, setIsSharingPdf] = useState<boolean>(false);
   const [isExportingExcel, setIsExportingExcel] = useState<boolean>(false);
+  const [isSharingExcel, setIsSharingExcel] = useState<boolean>(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [newRowValue, setNewRowValue] = useState<string>("");
   const [targetColumnIndex, setTargetColumnIndex] = useState<number>(0);
@@ -114,20 +195,35 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
     }, 50);
   };
 
-  const isMultiColumn = Array.isArray(columns) && columns.length > 1;
   const dateInfo = formatCurrentDateTime(calculationDate);
 
   // Multi-column copy or single-column copy
   const handleCopy = () => {
     let text = "";
-    if (isMultiColumn && columns) {
-      text = columns
-        .map((col) => `${col.title}:\n` + formatVerticalColumn(col.items, col.sum))
-        .join("\n\n");
-      if (typeof grandTotal === "number") {
-        text += `\n\n====================\nGRAND TOTAL = ${grandTotal}`;
-        if (grandFormula) {
-          text += ` (${grandFormula})`;
+    if (isMultiColumn && activeColumns.length > 0) {
+      if (matrixViewMode === "summary") {
+        text = `========================================\n`;
+        text += `${detectedTitle || "MEASUREMENT LIST"} - SUMMARISED RESULT\n`;
+        text += `Date: ${dateInfo.fullDisplay}\n`;
+        text += `Total Columns: ${summaryData.columnCount}\n`;
+        text += `Total Pieces/Count: ${summaryData.totalCount}\n`;
+        text += `Grand Total: ${formatDisplayNumber(summaryData.grandTotal)}\n`;
+        text += `Average per piece: ${summaryData.average}\n`;
+        text += `----------------------------------------\n`;
+        text += `COLUMN BREAKDOWN:\n`;
+        summaryData.columns.forEach((c) => {
+          text += `• ${c.title}: ${c.count} items, Subtotal = ${formatDisplayNumber(c.sum)} (Avg: ${c.average})\n`;
+        });
+        text += `----------------------------------------\n`;
+        text += `GRAND TOTAL = ${formatDisplayNumber(summaryData.grandTotal)}\n`;
+        text += `========================================`;
+      } else {
+        text = activeColumns
+          .map((col) => `${col.title}:\n` + formatVerticalColumn(col.items, col.sum))
+          .join("\n\n");
+        text += `\n\n====================\nGRAND TOTAL = ${effectiveGrandTotal}`;
+        if (effectiveGrandFormula) {
+          text += ` (${effectiveGrandFormula})`;
         }
       }
     } else {
@@ -150,10 +246,10 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
       const result = await shareCalculation({
         title: detectedTitle || "Vertical Addition Result",
         items,
-        sum,
-        columns,
-        grandTotal,
-        grandFormula,
+        sum: effectiveGrandTotal,
+        columns: activeColumns,
+        grandTotal: effectiveGrandTotal,
+        grandFormula: effectiveGrandFormula,
         imageSrc,
       });
 
@@ -177,17 +273,17 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
     }
   };
 
-  // Handle Export to PDF
+  // Handle Export to PDF (.pdf)
   const handleExportPdf = () => {
     setIsExportingPdf(true);
     try {
       const success = exportToPdf({
-        title: detectedTitle || "Vertical Addition Result",
+        title: detectedTitle || "Measurement Chart",
         items,
-        sum,
-        columns,
-        grandTotal,
-        grandFormula,
+        sum: effectiveGrandTotal,
+        columns: activeColumns,
+        grandTotal: effectiveGrandTotal,
+        grandFormula: effectiveGrandFormula,
         existingWrittenSum,
         notes: localNotes || notes,
         imageSrc,
@@ -205,17 +301,81 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
     }
   };
 
-  // Handle Export to Excel
+  // Handle Share PDF File directly or open full share dialog
+  const handleSharePdf = async () => {
+    if (onOpenShareModal) {
+      onOpenShareModal("pdf");
+      return;
+    }
+    setIsSharingPdf(true);
+    setShareFeedback(null);
+    try {
+      const res = await sharePdfFile({
+        title: detectedTitle || "Measurement Chart",
+        items,
+        sum: effectiveGrandTotal,
+        columns: activeColumns,
+        grandTotal: effectiveGrandTotal,
+        grandFormula: effectiveGrandFormula,
+        existingWrittenSum,
+        notes: localNotes || notes,
+        imageSrc,
+        calculationDate,
+        measurementMetadata,
+        isMeasurementChart: isFullPageMeasurementChart,
+      });
+      if (res.success) {
+        if (onExportSuccess) onExportSuccess(res.message);
+        setShareFeedback(res.type === "native_share" ? "PDF Shared!" : "PDF Downloaded!");
+        setTimeout(() => setShareFeedback(null), 3500);
+      } else {
+        // Fallback to direct download
+        handleExportPdf();
+      }
+    } catch (err) {
+      console.error("Share PDF error:", err);
+      handleExportPdf();
+    } finally {
+      setIsSharingPdf(false);
+    }
+  };
+
+  // Handle Preview PDF in browser tab
+  const handlePreviewPdf = () => {
+    try {
+      const ok = previewPdf({
+        title: detectedTitle || "Measurement Chart",
+        items,
+        sum: effectiveGrandTotal,
+        columns: activeColumns,
+        grandTotal: effectiveGrandTotal,
+        grandFormula: effectiveGrandFormula,
+        existingWrittenSum,
+        notes: localNotes || notes,
+        imageSrc,
+        calculationDate,
+        measurementMetadata,
+        isMeasurementChart: isFullPageMeasurementChart,
+      });
+      if (ok && onExportSuccess) {
+        onExportSuccess("Opening PDF report preview...");
+      }
+    } catch (err) {
+      console.error("Preview PDF error:", err);
+    }
+  };
+
+  // Handle Export to Excel (.xlsx)
   const handleExportExcel = () => {
     setIsExportingExcel(true);
     try {
       const success = exportToExcel({
-        title: detectedTitle || "Vertical Addition Result",
+        title: detectedTitle || "Measurement Chart",
         items,
-        sum,
-        columns,
-        grandTotal,
-        grandFormula,
+        sum: effectiveGrandTotal,
+        columns: activeColumns,
+        grandTotal: effectiveGrandTotal,
+        grandFormula: effectiveGrandFormula,
         existingWrittenSum,
         notes: localNotes || notes,
         calculationDate,
@@ -223,7 +383,7 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
         isMeasurementChart: isFullPageMeasurementChart,
       });
       if (success && onExportSuccess) {
-        onExportSuccess("Excel spreadsheet downloaded successfully!");
+        onExportSuccess("Excel spreadsheet (.xlsx) downloaded successfully!");
       }
     } catch (err) {
       console.error("Excel export error:", err);
@@ -232,10 +392,47 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
     }
   };
 
+  // Handle Share Excel File directly or open full share dialog
+  const handleShareExcel = async () => {
+    if (onOpenShareModal) {
+      onOpenShareModal("excel");
+      return;
+    }
+    setIsSharingExcel(true);
+    setShareFeedback(null);
+    try {
+      const res = await shareExcelFile({
+        title: detectedTitle || "Measurement Chart",
+        items,
+        sum: effectiveGrandTotal,
+        columns: activeColumns,
+        grandTotal: effectiveGrandTotal,
+        grandFormula: effectiveGrandFormula,
+        existingWrittenSum,
+        notes: localNotes || notes,
+        calculationDate,
+        measurementMetadata,
+        isMeasurementChart: isFullPageMeasurementChart,
+      });
+      if (res.success) {
+        if (onExportSuccess) onExportSuccess(res.message);
+        setShareFeedback(res.type === "native_share" ? "Excel Shared!" : "Excel Downloaded!");
+        setTimeout(() => setShareFeedback(null), 3500);
+      } else {
+        // Fallback to direct download
+        handleExportExcel();
+      }
+    } catch (err) {
+      console.error("Share Excel error:", err);
+      handleExportExcel();
+    } finally {
+      setIsSharingExcel(false);
+    }
+  };
+
   // Update item value in single or multi column mode
   const handleValueChange = (id: string, valStr: string) => {
-    const parsed = parseFloat(valStr);
-    const numericVal = isNaN(parsed) ? 0 : parsed;
+    const numericVal = normalize3DigitValue(valStr);
 
     if (isMultiColumn && columns && onUpdateColumns) {
       const updated = columns.map((col) => {
@@ -304,7 +501,7 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
   // Add a new row to a column
   const handleAddNewItem = (e: React.FormEvent) => {
     e.preventDefault();
-    const val = parseFloat(newRowValue);
+    const val = normalize3DigitValue(newRowValue);
     if (isNaN(val)) return;
 
     if (isMultiColumn && columns && onUpdateColumns) {
@@ -390,7 +587,9 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
     return (
       <div
         key={`col-card-${colIdx}`}
-        className="flex-1 min-w-[280px] bg-white dark:bg-slate-900 rounded-xl border border-slate-200/90 dark:border-slate-800 shadow-xs flex flex-col justify-between overflow-hidden"
+        className={`bg-white dark:bg-slate-900 rounded-xl border border-slate-200/90 dark:border-slate-800 shadow-xs flex flex-col justify-between overflow-hidden ${
+          isMultiColumn ? "flex-1 min-w-[280px]" : "w-full max-w-md mx-auto"
+        }`}
       >
         {/* Column Header */}
         <div className="px-4 py-3 bg-slate-50/80 dark:bg-slate-800/60 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
@@ -417,12 +616,12 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
             {matches ? (
               <>
                 <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
-                <span>Verified with written total: <strong>{colWrittenSum}</strong></span>
+                <span>Verified with written total: <strong>{formatDisplayNumber(colWrittenSum)}</strong></span>
               </>
             ) : (
               <>
                 <AlertTriangle className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 shrink-0" />
-                <span>Written: {colWrittenSum} • Calculated: {colSum}</span>
+                <span>Written: {formatDisplayNumber(colWrittenSum)} • Calculated: {formatDisplayNumber(colSum)}</span>
               </>
             )}
           </div>
@@ -430,99 +629,115 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
 
         {/* Numbers Stack */}
         <div className="p-4 flex-1 font-mono">
-          <div className="space-y-1.5">
-            {colItems.map((item, index) => {
-              const isHovered = hoveredItemId === item.id;
-              const isEditing = editingId === item.id;
-
-              return (
-                <div
-                  key={item.id}
-                  onMouseEnter={() => onHoverItem(item.id)}
-                  onMouseLeave={() => onHoverItem(null)}
-                  className={`group relative flex items-center justify-between p-1.5 rounded-lg transition-all ${
-                    isHovered
-                      ? "bg-blue-50/90 dark:bg-blue-950/50 ring-1 ring-blue-300 dark:ring-blue-700"
-                      : "hover:bg-slate-50 dark:hover:bg-slate-800/70"
-                  }`}
-                >
-                  {/* Left Label & Action buttons */}
-                  <div className="flex items-center gap-1.5 min-w-0 pr-1 font-sans">
-                    {isEditing ? (
-                      <input
-                        type="text"
-                        defaultValue={item.label || `Line ${index + 1}`}
-                        onBlur={(e) => handleLabelChange(item.id, e.target.value)}
-                        className="text-[11px] px-1.5 py-0.5 border border-blue-400 dark:border-blue-500 rounded bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 w-20 outline-none font-sans"
-                        placeholder="Label"
-                      />
-                    ) : (
-                      <span
-                        className="text-[11px] text-slate-400 dark:text-slate-500 truncate max-w-[90px]"
-                        title={item.label}
-                      >
-                        {item.label || `Item ${index + 1}`}
-                      </span>
-                    )}
-
-                    <button
-                      type="button"
-                      onClick={() => setEditingId(isEditing ? null : item.id)}
-                      className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 p-0.5 rounded transition-opacity cursor-pointer"
-                      title="Edit number or label"
-                    >
-                      <Edit3 className="w-3 h-3" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleDeleteItem(item.id)}
-                      className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-rose-600 dark:hover:text-rose-400 p-0.5 rounded transition-opacity cursor-pointer"
-                      title="Delete number"
-                    >
-                      <Trash2 className="w-3 h-3" />
-                    </button>
-                  </div>
-
-                  {/* Right: Operator & Value */}
-                  <div className="flex items-center space-x-2 text-right">
-                    <span className="w-3 text-slate-400 dark:text-slate-500 text-sm font-bold text-center select-none font-sans">
-                      {index === 0 ? "" : "+"}
-                    </span>
-
-                    {isEditing ? (
-                      <input
-                        type="number"
-                        step="any"
-                        value={item.value}
-                        onChange={(e) => handleValueChange(item.id, e.target.value)}
-                        className="w-24 text-right font-mono text-lg font-bold text-slate-900 dark:text-slate-100 border-b-2 border-blue-500 bg-blue-50/50 dark:bg-blue-950/40 outline-none px-1"
-                        autoFocus
-                      />
-                    ) : (
-                      <span
-                        onClick={() => setEditingId(item.id)}
-                        className="font-mono text-xl sm:text-2xl font-bold text-slate-900 dark:text-slate-100 tracking-tight cursor-pointer hover:text-blue-600 dark:hover:text-blue-400 select-all"
-                        title="Click to edit value"
-                      >
-                        {item.value}
-                      </span>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
-          {/* Summation line */}
-          <div className="my-2.5 border-b-2 border-slate-800 dark:border-slate-300" />
-
-          {/* Line Final Result */}
-          <div className="flex items-center justify-between px-3 py-2 bg-blue-50/80 dark:bg-blue-950/40 rounded-lg border border-blue-100 dark:border-blue-900/60">
-            <div className="text-[11px] font-sans font-bold text-blue-900 dark:text-blue-200 uppercase tracking-wider">
-              {isMultiColumn ? `${colTitle} Result` : "Total Sum"}
+          {colItems.length === 0 ? (
+            <div className="py-8 text-center text-xs text-slate-400 dark:text-slate-500 font-sans">
+              No numbers in this column yet.
+              <br />
+              Click below to add a number.
             </div>
-            <div className="font-mono text-2xl font-extrabold text-blue-700 dark:text-blue-300 tracking-tight">
-              {colSum}
+          ) : (
+            <div className="space-y-1.5">
+              {colItems.map((item, index) => {
+                const isHovered = hoveredItemId === item.id;
+                const isEditing = editingId === item.id;
+
+                return (
+                  <div
+                    key={item.id}
+                    onMouseEnter={() => onHoverItem(item.id)}
+                    onMouseLeave={() => onHoverItem(null)}
+                    className={`group relative flex items-center justify-between p-1.5 rounded-lg transition-all ${
+                      isHovered
+                        ? "bg-blue-50/90 dark:bg-blue-950/50 ring-1 ring-blue-300 dark:ring-blue-700"
+                        : "hover:bg-slate-50 dark:hover:bg-slate-800/70"
+                    }`}
+                  >
+                    {/* Left Label & Action buttons */}
+                    <div className="flex items-center gap-1.5 min-w-0 pr-1 font-sans">
+                      {isEditing ? (
+                        <input
+                          type="text"
+                          defaultValue={item.label || `Line ${index + 1}`}
+                          onBlur={(e) => handleLabelChange(item.id, e.target.value)}
+                          className="text-[11px] px-1.5 py-0.5 border border-blue-400 dark:border-blue-500 rounded bg-white dark:bg-slate-800 text-slate-900 dark:text-slate-100 w-20 outline-none font-sans"
+                          placeholder="Label"
+                        />
+                      ) : (
+                        <span
+                          className="text-[11px] text-slate-400 dark:text-slate-500 truncate max-w-[90px]"
+                          title={item.label}
+                        >
+                          {item.label || `Item ${index + 1}`}
+                        </span>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() => setEditingId(isEditing ? null : item.id)}
+                        className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 p-0.5 rounded transition-opacity cursor-pointer"
+                        title="Edit number or label"
+                      >
+                        <Edit3 className="w-3 h-3" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteItem(item.id)}
+                        className="opacity-0 group-hover:opacity-100 text-slate-400 hover:text-rose-600 dark:hover:text-rose-400 p-0.5 rounded transition-opacity cursor-pointer"
+                        title="Delete number"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    </div>
+
+                    {/* Right: Operator & Value */}
+                    <div className="flex items-center space-x-2 text-right">
+                      <span className="w-3 text-slate-400 dark:text-slate-500 text-sm font-bold text-center select-none font-sans">
+                        {index === 0 ? "" : "+"}
+                      </span>
+
+                      {isEditing ? (
+                        <input
+                          type="number"
+                          step="any"
+                          value={item.value}
+                          onChange={(e) => handleValueChange(item.id, e.target.value)}
+                          className="w-24 text-right font-mono text-lg font-bold text-slate-900 dark:text-slate-100 border-b-2 border-blue-500 bg-blue-50/50 dark:bg-blue-950/40 outline-none px-1"
+                          autoFocus
+                        />
+                      ) : (
+                        <span
+                          onClick={() => setEditingId(item.id)}
+                          className="font-mono text-xl sm:text-2xl font-bold text-slate-900 dark:text-slate-100 tracking-tight cursor-pointer hover:text-blue-600 dark:hover:text-blue-400 select-all"
+                          title="Click to edit value"
+                        >
+                          {formatDisplayNumber(item.value)}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Traditional Mathematical Summation Line */}
+          <div className="my-2.5 border-b-2 border-slate-700 dark:border-slate-300" />
+
+          {/* Line Final Result with Classical Accounting Double Underline */}
+          <div className="flex items-center justify-between px-3 py-2.5 bg-gradient-to-r from-blue-50 to-indigo-50 dark:from-blue-950/60 dark:to-indigo-950/60 rounded-xl border border-blue-200/80 dark:border-blue-900/60">
+            <div className="flex flex-col">
+              <span className="text-[11px] font-sans font-extrabold text-blue-900 dark:text-blue-200 uppercase tracking-wider flex items-center gap-1">
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                {isMultiColumn ? `${colTitle} Total` : "Total Sum"}
+              </span>
+              <span className="text-[10px] text-slate-500 dark:text-slate-400 font-mono">
+                {colItems.length} {colItems.length === 1 ? "entry" : "entries"}
+              </span>
+            </div>
+            <div className="text-right">
+              <div className="font-mono text-2xl sm:text-3xl font-black text-blue-700 dark:text-blue-300 tracking-tight border-b-4 border-double border-blue-600 dark:border-blue-400 pb-0.5">
+                {formatDisplayNumber(colSum)}
+              </div>
             </div>
           </div>
         </div>
@@ -554,6 +769,12 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
                 Single Column
               </span>
             )}
+            <span
+              className="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-amber-50 dark:bg-amber-950/60 text-amber-700 dark:text-amber-300 border border-amber-200/60 dark:border-amber-800 font-mono"
+              title="Rule: When performing addition, any 3-digit number has a decimal point placed after the first two digits (e.g., 333 as 33.3)"
+            >
+              Rule: 333 = 33.3
+            </span>
           </div>
 
           {/* Current Date Display */}
@@ -571,38 +792,73 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
           </p>
         </div>
 
-        {/* Header Actions: View Toggle, Export PDF, Excel, Copy, Share */}
+        {/* Header Actions: View Toggle, Column Count, Export PDF, Excel, Copy, Share */}
         <div className="flex items-center gap-2 flex-wrap">
-          {isMultiColumn && (
-            <div className="flex items-center p-0.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs">
+          {/* View Mode Selector: Summarised, Matrix, Cards */}
+          <div className="flex items-center p-0.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs">
+            <button
+              type="button"
+              onClick={() => setMatrixViewMode("summary")}
+              className={`px-2.5 py-1 rounded-md font-semibold inline-flex items-center gap-1 transition-all cursor-pointer ${
+                matrixViewMode === "summary"
+                  ? "bg-white dark:bg-slate-700 text-indigo-700 dark:text-indigo-300 shadow-xs"
+                  : "text-slate-600 dark:text-slate-400 hover:text-slate-900"
+              }`}
+              title="Summarised multiple column breakdown"
+            >
+              <BarChart3 className="w-3.5 h-3.5" />
+              <span>Summarised Only</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setMatrixViewMode("matrix")}
+              className={`px-2.5 py-1 rounded-md font-semibold inline-flex items-center gap-1 transition-all cursor-pointer ${
+                matrixViewMode === "matrix"
+                  ? "bg-white dark:bg-slate-700 text-emerald-700 dark:text-emerald-300 shadow-xs"
+                  : "text-slate-600 dark:text-slate-400 hover:text-slate-900"
+              }`}
+              title="Spreadsheet style side-by-side matrix table"
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5" />
+              <span>Matrix Grid</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setMatrixViewMode("cards")}
+              className={`px-2.5 py-1 rounded-md font-semibold inline-flex items-center gap-1 transition-all cursor-pointer ${
+                matrixViewMode === "cards"
+                  ? "bg-white dark:bg-slate-700 text-blue-700 dark:text-blue-300 shadow-xs"
+                  : "text-slate-600 dark:text-slate-400 hover:text-slate-900"
+              }`}
+              title="Individual vertical column cards"
+            >
+              <Layers className="w-3.5 h-3.5" />
+              <span>Cards</span>
+            </button>
+          </div>
+
+          {/* Column Layout Selector */}
+          <div className="hidden sm:flex items-center p-0.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs">
+            <span className="px-1.5 text-[11px] font-semibold text-slate-500 dark:text-slate-400 flex items-center gap-1">
+              <Columns className="w-3 h-3 text-blue-500" />
+              <span>Cols:</span>
+            </span>
+            {[2, 3, 4, 5, 8].map((num) => (
               <button
+                key={num}
                 type="button"
-                onClick={() => setMatrixViewMode("matrix")}
-                className={`px-2.5 py-1 rounded-md font-semibold inline-flex items-center gap-1 transition-all cursor-pointer ${
-                  matrixViewMode === "matrix"
-                    ? "bg-white dark:bg-slate-700 text-emerald-700 dark:text-emerald-300 shadow-xs"
-                    : "text-slate-600 dark:text-slate-400 hover:text-slate-900"
+                onClick={() => handleSplitColumns(num)}
+                className={`px-2 py-0.5 rounded-md text-xs font-semibold cursor-pointer transition-colors ${
+                  activeColumns.length === num
+                    ? "bg-blue-600 text-white shadow-xs"
+                    : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
                 }`}
-                title="Spreadsheet style side-by-side matrix table"
+                title={`Change result to ${num} multiple columns`}
               >
-                <FileSpreadsheet className="w-3.5 h-3.5" />
-                <span>Matrix Grid</span>
+                {num}
               </button>
-              <button
-                type="button"
-                onClick={() => setMatrixViewMode("cards")}
-                className={`px-2.5 py-1 rounded-md font-semibold inline-flex items-center gap-1 transition-all cursor-pointer ${
-                  matrixViewMode === "cards"
-                    ? "bg-white dark:bg-slate-700 text-blue-700 dark:text-blue-300 shadow-xs"
-                    : "text-slate-600 dark:text-slate-400 hover:text-slate-900"
-                }`}
-                title="Individual vertical column cards"
-              >
-                <Layers className="w-3.5 h-3.5" />
-                <span>Cards</span>
-              </button>
-            </div>
-          )}
+            ))}
+          </div>
 
           {isMultiColumn && onUpdateColumns && (
             <button
@@ -616,40 +872,70 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
             </button>
           )}
 
-          {/* Export to PDF button */}
-          <button
-            type="button"
-            onClick={handleExportPdf}
-            disabled={isExportingPdf}
-            className="px-3 py-1.5 rounded-lg border border-rose-200 dark:border-rose-900/60 bg-rose-50/70 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-900/50 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
-            title="Download formatted PDF report with calculation details and date"
-          >
-            <FileText className="w-3.5 h-3.5 text-rose-600 dark:text-rose-400" />
-            <span>PDF</span>
-          </button>
+          {/* Excel Actions */}
+          <div className="inline-flex rounded-lg border border-emerald-200 dark:border-emerald-900/60 bg-emerald-50/70 dark:bg-emerald-950/40 p-0.5">
+            <button
+              type="button"
+              onClick={handleExportExcel}
+              disabled={isExportingExcel}
+              className="px-2.5 py-1 rounded-md text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
+              title="Download Microsoft Excel spreadsheet (.xlsx)"
+            >
+              <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+              <span>Excel</span>
+            </button>
+            <button
+              type="button"
+              onClick={handleShareExcel}
+              disabled={isSharingExcel}
+              className="px-2 py-1 rounded-md text-emerald-600 dark:text-emerald-400 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 text-xs font-medium inline-flex items-center gap-1 transition-colors cursor-pointer disabled:opacity-50"
+              title="Share Excel file via WhatsApp, Email, etc."
+            >
+              <Share2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
 
-          {/* Export to Excel button */}
-          <button
-            type="button"
-            onClick={handleExportExcel}
-            disabled={isExportingExcel}
-            className="px-3 py-1.5 rounded-lg border border-emerald-200 dark:border-emerald-900/60 bg-emerald-50/70 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
-            title="Download Microsoft Excel spreadsheet (.xlsx)"
-          >
-            <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
-            <span>Excel</span>
-          </button>
+          {/* PDF Actions */}
+          <div className="inline-flex rounded-lg border border-rose-200 dark:border-rose-900/60 bg-rose-50/70 dark:bg-rose-950/40 p-0.5">
+            <button
+              type="button"
+              onClick={handleExportPdf}
+              disabled={isExportingPdf}
+              className="px-2.5 py-1 rounded-md text-rose-700 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-900/50 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
+              title="Download formatted PDF report (.pdf)"
+            >
+              <FileText className="w-3.5 h-3.5 text-rose-600 dark:text-rose-400" />
+              <span>PDF</span>
+            </button>
+            <button
+              type="button"
+              onClick={handleSharePdf}
+              disabled={isSharingPdf}
+              className="px-2 py-1 rounded-md text-rose-600 dark:text-rose-400 hover:bg-rose-100 dark:hover:bg-rose-900/50 text-xs font-medium inline-flex items-center gap-1 transition-colors cursor-pointer disabled:opacity-50"
+              title="Share PDF report file via WhatsApp, Email, etc."
+            >
+              <Share2 className="w-3.5 h-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={handlePreviewPdf}
+              className="px-1.5 py-1 rounded-md text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-slate-100 hover:bg-rose-100 dark:hover:bg-rose-900/50 text-xs font-medium inline-flex items-center gap-1 transition-colors cursor-pointer"
+              title="Preview / Print PDF in browser"
+            >
+              <Eye className="w-3.5 h-3.5" />
+            </button>
+          </div>
 
           <button
             type="button"
             onClick={handleCopy}
             className="px-2.5 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer"
-            title="Copy vertical addition formula"
+            title="Copy calculation numbers to clipboard"
           >
             {copied ? (
               <>
                 <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
-                <span className="text-emerald-700 dark:text-emerald-300">Copied!</span>
+                <span className="text-emerald-700 dark:text-emerald-300 font-medium">Copied!</span>
               </>
             ) : (
               <>
@@ -664,7 +950,7 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
             onClick={handleShare}
             disabled={isSharing}
             className="px-2.5 py-1.5 rounded-lg border border-blue-200 dark:border-blue-800/80 bg-blue-50/70 dark:bg-blue-950/50 text-blue-700 dark:text-blue-300 hover:bg-blue-100 dark:hover:bg-blue-900/50 text-xs font-medium inline-flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
-            title="Share calculation results via Web Share API"
+            title="Share text summary"
           >
             {shareFeedback ? (
               <>
@@ -674,7 +960,7 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
             ) : (
               <>
                 <Share2 className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-                <span>Share</span>
+                <span>Share Text</span>
               </>
             )}
           </button>
@@ -683,69 +969,389 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
 
       {/* Main Calculation Stage */}
       <div className="p-5 sm:p-6 bg-slate-50/50 dark:bg-slate-950/40">
-        {isMultiColumn && columns ? (
-          matrixViewMode === "matrix" ? (
-            <MeasurementChartMatrix
-              columns={columns}
-              measurementMetadata={measurementMetadata}
-              grandTotal={grandTotal}
-              grandFormula={grandFormula}
-              notes={localNotes || notes}
-              calculationDate={calculationDate}
-              onUpdateColumns={onUpdateColumns || (() => {})}
-              onExportPdf={handleExportPdf}
-              onExportExcel={handleExportExcel}
-              onCopy={handleCopy}
-              copied={copied}
-            />
-          ) : (
-            <div className="space-y-6">
-              {/* Multiple Vertical Columns side-by-side */}
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                {columns.map((col, idx) =>
-                  renderColumnCard(col.items, col.sum, col.title, col.formula, col.existingWrittenSum, idx)
-                )}
-              </div>
-
-              {/* Prominent Combined Grand Total Final Result */}
-              <div className="p-5 rounded-2xl bg-gradient-to-br from-indigo-900 via-blue-900 to-slate-900 dark:from-indigo-950 dark:via-blue-950 dark:to-slate-950 text-white shadow-md border border-indigo-800/30">
-                <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-                  <div>
-                    <div className="flex items-center gap-2 mb-1">
-                      <span className="px-2.5 py-0.5 rounded-full bg-blue-500/30 text-blue-200 text-[11px] font-semibold uppercase tracking-wider border border-blue-400/30">
-                        Combined Final Result
-                      </span>
-                      <span className="text-xs text-slate-300 dark:text-slate-400">
-                        Sum of all {columns.length} vertical lines
-                      </span>
-                    </div>
-                    <div className="text-xs text-blue-200 dark:text-blue-300 font-mono mt-1">
-                      {grandFormula || columns.map((c) => `${c.title} (${c.sum})`).join(" + ")}
-                    </div>
+        {matrixViewMode === "summary" ? (
+          /* Summarised Only View with Multiple Columns */
+          <div className="space-y-6">
+            {/* 1. Prominent Multi-Column Grand Summary Banner */}
+            <div className="p-5 sm:p-6 rounded-2xl bg-gradient-to-br from-indigo-900 via-blue-900 to-slate-900 text-white shadow-md border border-indigo-700/40">
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6">
+                <div>
+                  <div className="flex items-center gap-2 mb-2 flex-wrap">
+                    <span className="px-2.5 py-1 rounded-full bg-blue-500/30 text-blue-200 text-xs font-bold uppercase tracking-wider border border-blue-400/30 flex items-center gap-1.5">
+                      <BarChart3 className="w-3.5 h-3.5" />
+                      Multiple Column Summarised Result
+                    </span>
+                    <span
+                      className="px-2.5 py-1 rounded-full bg-amber-400/20 text-amber-300 text-xs font-semibold border border-amber-300/30 font-mono"
+                      title="Active rule: Any 3-digit number has a decimal point after first two digits (e.g. 333 = 33.3)"
+                    >
+                      Rule: 333 = 33.3
+                    </span>
+                    <span className="text-xs text-blue-200/80 font-mono">
+                      {dateInfo.fullDisplay}
+                    </span>
                   </div>
+                  <h2 className="text-2xl sm:text-3xl font-extrabold tracking-tight text-white">
+                    {detectedTitle || "Measurement Chart Summary"}
+                  </h2>
+                  <p className="text-xs sm:text-sm text-blue-100/80 mt-1 max-w-xl">
+                    {activeColumns.length} vertical lines summarized with verified 3-digit normalization.
+                  </p>
+                </div>
 
-                  <div className="text-right self-end sm:self-center">
-                    <div className="text-[11px] uppercase tracking-wider text-slate-300 dark:text-slate-400 font-semibold mb-0.5">
+                {/* Grand Total Highlight Badge */}
+                <div className="p-4 rounded-xl bg-white/10 backdrop-blur-xs border border-white/20 flex items-center justify-between lg:justify-end gap-6 shrink-0">
+                  <div>
+                    <div className="text-[11px] uppercase tracking-wider text-blue-200 font-semibold mb-0.5">
                       Grand Total
                     </div>
-                    <div className="text-3xl sm:text-4xl font-extrabold font-mono text-white tracking-tight">
-                      {grandTotal ?? sum}
+                    <div className="text-3xl sm:text-4xl font-black font-mono text-white tracking-tight">
+                      <AnimatedGrandTotal value={effectiveGrandTotal} showIndicator />
                     </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleCopy}
+                    className="px-3 py-2 rounded-lg bg-blue-500 hover:bg-blue-400 text-white text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
+                    title="Copy summarized text to clipboard"
+                  >
+                    {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{copied ? "Copied" : "Copy Summary"}</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* 4 Summary Stat Cards */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-6 pt-5 border-t border-white/10">
+                <div className="p-3 rounded-xl bg-white/5 border border-white/10">
+                  <div className="text-[11px] text-blue-200/80 font-semibold uppercase tracking-wider">
+                    Total Entries
+                  </div>
+                  <div className="text-2xl font-mono font-black text-white mt-0.5">
+                    {summaryData.totalCount}
+                  </div>
+                  <div className="text-[10px] text-blue-300/70 mt-0.5">Counted items</div>
+                </div>
+
+                <div className="p-3 rounded-xl bg-white/5 border border-white/10">
+                  <div className="text-[11px] text-blue-200/80 font-semibold uppercase tracking-wider">
+                    Columns
+                  </div>
+                  <div className="text-2xl font-mono font-black text-white mt-0.5">
+                    {summaryData.columnCount}
+                  </div>
+                  <div className="text-[10px] text-blue-300/70 mt-0.5">Vertical tallies</div>
+                </div>
+
+                <div className="p-3 rounded-xl bg-white/5 border border-white/10">
+                  <div className="text-[11px] text-blue-200/80 font-semibold uppercase tracking-wider">
+                    Average / Item
+                  </div>
+                  <div className="text-2xl font-mono font-black text-white mt-0.5">
+                    {summaryData.average}
+                  </div>
+                  <div className="text-[10px] text-blue-300/70 mt-0.5">Mean per piece</div>
+                </div>
+
+                <div className="p-3 rounded-xl bg-white/5 border border-white/10">
+                  <div className="text-[11px] text-blue-200/80 font-semibold uppercase tracking-wider">
+                    Highest Column
+                  </div>
+                  <div className="text-2xl font-mono font-black text-emerald-300 mt-0.5 truncate">
+                    {formatDisplayNumber(
+                      summaryData.columns.length > 0 ? Math.max(...summaryData.columns.map((c) => c.sum)) : 0
+                    )}
+                  </div>
+                  <div className="text-[10px] text-blue-300/70 mt-0.5">Max column subtotal</div>
+                </div>
+              </div>
+            </div>
+
+            {/* 2. Column Controls Bar: Change Number of Multiple Columns */}
+            <div className="p-3.5 bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 shadow-xs flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs font-bold text-slate-700 dark:text-slate-300 flex items-center gap-1.5">
+                  <Columns className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+                  <span>Change Number of Columns:</span>
+                </span>
+                <div className="inline-flex items-center p-0.5 rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
+                  {[2, 3, 4, 5, 8].map((num) => (
+                    <button
+                      key={num}
+                      type="button"
+                      onClick={() => handleSplitColumns(num)}
+                      className={`px-3 py-1 rounded-md text-xs font-bold transition-all cursor-pointer ${
+                        activeColumns.length === num
+                          ? "bg-blue-600 text-white shadow-xs"
+                          : "text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white"
+                      }`}
+                      title={`Switch to ${num} multiple columns`}
+                    >
+                      {num} Columns
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setMatrixViewMode("matrix")}
+                  className="text-xs font-semibold text-emerald-600 dark:text-emerald-400 hover:underline cursor-pointer inline-flex items-center gap-1"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5" />
+                  <span>View Detailed Matrix</span>
+                </button>
+              </div>
+            </div>
+
+            {/* 3. Multiple Columns Summarised Comparison Table */}
+            <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-xs overflow-hidden">
+              <div className="p-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <FileSpreadsheet className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+                  <h4 className="font-bold text-sm text-slate-900 dark:text-slate-100">
+                    Multiple Columns Summary Table
+                  </h4>
+                </div>
+                <span className="text-xs font-semibold text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-950/60 px-2.5 py-0.5 rounded-full border border-indigo-200 dark:border-indigo-800">
+                  {summaryData.columnCount} Vertical Lines
+                </span>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse text-xs">
+                  <thead>
+                    <tr className="bg-slate-50 dark:bg-slate-800/80 border-b border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 uppercase tracking-wider font-bold">
+                      <th className="p-3 w-12 text-center">#</th>
+                      <th className="p-3">Column Line</th>
+                      <th className="p-3 text-center">Entries</th>
+                      <th className="p-3 text-right">Subtotal Sum</th>
+                      <th className="p-3 text-right">Average</th>
+                      <th className="p-3 text-right">Share of Total</th>
+                      <th className="p-3 text-center">Range (Min - Max)</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
+                    {summaryData.columns.map((col, idx) => {
+                      const vals = col.items.map((i) => i.value);
+                      const minVal = vals.length > 0 ? Math.min(...vals) : 0;
+                      const maxVal = vals.length > 0 ? Math.max(...vals) : 0;
+                      return (
+                        <tr
+                          key={col.id}
+                          className="hover:bg-blue-50/50 dark:hover:bg-slate-800/50 transition-colors"
+                        >
+                          <td className="p-3 font-mono text-center text-slate-400 font-semibold">
+                            {idx + 1}
+                          </td>
+                          <td className="p-3 font-bold text-slate-800 dark:text-slate-200">
+                            {col.title}
+                          </td>
+                          <td className="p-3 text-center font-mono font-semibold text-slate-600 dark:text-slate-400">
+                            <span className="px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800">
+                              {col.count}
+                            </span>
+                          </td>
+                          <td className="p-3 text-right font-mono font-bold text-slate-900 dark:text-slate-100 text-sm">
+                            {formatDisplayNumber(col.sum)}
+                          </td>
+                          <td className="p-3 text-right font-mono text-slate-600 dark:text-slate-300">
+                            {col.average}
+                          </td>
+                          <td className="p-3 text-right font-mono text-slate-500 dark:text-slate-400">
+                            <div className="flex items-center justify-end gap-1.5">
+                              <div className="w-12 bg-slate-100 dark:bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                                <div
+                                  className="bg-indigo-600 h-full rounded-full"
+                                  style={{ width: `${Math.min(col.percentage, 100)}%` }}
+                                />
+                              </div>
+                              <span>{col.percentage}%</span>
+                            </div>
+                          </td>
+                          <td className="p-3 text-center font-mono text-slate-500 dark:text-slate-400 text-[11px]">
+                            {vals.length > 0 ? `${minVal} – ${maxVal}` : "—"}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                  <tfoot>
+                    <tr className="bg-slate-100 dark:bg-slate-800 font-bold border-t-2 border-slate-300 dark:border-slate-600">
+                      <td
+                        colSpan={2}
+                        className="p-3.5 text-slate-900 dark:text-white uppercase tracking-wider text-xs"
+                      >
+                        GRAND TOTAL ({summaryData.columnCount} COLUMNS)
+                      </td>
+                      <td className="p-3.5 text-center font-mono text-slate-900 dark:text-white text-sm">
+                        {summaryData.totalCount} items
+                      </td>
+                      <td className="p-3.5 text-right font-mono font-black text-indigo-600 dark:text-indigo-400 text-base">
+                        <AnimatedGrandTotal value={summaryData.grandTotal} showIndicator />
+                      </td>
+                      <td className="p-3.5 text-right font-mono text-slate-700 dark:text-slate-300">
+                        {summaryData.average}
+                      </td>
+                      <td className="p-3.5 text-right font-mono text-slate-700 dark:text-slate-300">
+                        100.0%
+                      </td>
+                      <td className="p-3.5 text-center text-slate-400 text-xs">
+                        Verified
+                      </td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
+            </div>
+
+            {/* 4. Column Summary Cards Grid */}
+            <div>
+              <div className="flex items-center justify-between mb-3">
+                <h4 className="font-bold text-sm text-slate-900 dark:text-slate-100 flex items-center gap-1.5">
+                  <Layers className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+                  <span>Column Breakdown Cards</span>
+                </h4>
+                <button
+                  type="button"
+                  onClick={() => setMatrixViewMode("cards")}
+                  className="text-xs font-semibold text-blue-600 dark:text-blue-400 hover:underline cursor-pointer flex items-center gap-1"
+                >
+                  <span>View Number Lists</span>
+                  <span>→</span>
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                {summaryData.columns.map((col) => (
+                  <div
+                    key={col.id}
+                    className="p-4 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-xs hover:border-blue-400 transition-all"
+                  >
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-bold text-slate-800 dark:text-slate-200">
+                        {col.title}
+                      </span>
+                      <span className="text-[11px] px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 font-mono font-semibold">
+                        {col.count} items
+                      </span>
+                    </div>
+
+                    <div className="font-mono text-2xl font-black text-slate-900 dark:text-slate-100 my-1">
+                      {formatDisplayNumber(col.sum)}
+                    </div>
+
+                    <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400 pt-2 border-t border-slate-100 dark:border-slate-800 font-mono">
+                      <span>
+                        Avg: <strong>{col.average}</strong>
+                      </span>
+                      <span>
+                        Share: <strong>{col.percentage}%</strong>
+                      </span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        ) : matrixViewMode === "matrix" ? (
+          <MeasurementChartMatrix
+            columns={activeColumns}
+            measurementMetadata={measurementMetadata}
+            grandTotal={effectiveGrandTotal}
+            grandFormula={effectiveGrandFormula}
+            notes={localNotes || notes}
+            calculationDate={calculationDate}
+            onUpdateColumns={onUpdateColumns || (() => {})}
+            onExportPdf={handleExportPdf}
+            onSharePdf={handleSharePdf}
+            onPreviewPdf={handlePreviewPdf}
+            onExportExcel={handleExportExcel}
+            onShareExcel={handleShareExcel}
+            onCopy={handleCopy}
+            copied={copied}
+          />
+        ) : isMultiColumn ? (
+          <div className="space-y-6">
+            {/* Multiple Vertical Columns side-by-side */}
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+              {activeColumns.map((col, idx) =>
+                renderColumnCard(col.items, col.sum, col.title, col.formula, col.existingWrittenSum, idx)
+              )}
+            </div>
+
+            {/* Prominent Combined Grand Total Final Result */}
+            <div className="p-5 rounded-2xl bg-gradient-to-br from-indigo-900 via-blue-900 to-slate-900 dark:from-indigo-950 dark:via-blue-950 dark:to-slate-950 text-white shadow-md border border-indigo-800/30">
+              <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                <div>
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="px-2.5 py-0.5 rounded-full bg-blue-500/30 text-blue-200 text-[11px] font-semibold uppercase tracking-wider border border-blue-400/30">
+                      Combined Final Result
+                    </span>
+                    <span className="text-xs text-slate-300 dark:text-slate-400">
+                      Sum of all {activeColumns.length} vertical lines
+                    </span>
+                  </div>
+                  <div className="text-xs text-blue-200 dark:text-blue-300 font-mono mt-1">
+                    {effectiveGrandFormula || activeColumns.map((c) => `${c.title} (${c.sum})`).join(" + ")}
+                  </div>
+                </div>
+
+                <div className="text-right self-end sm:self-center">
+                  <div className="text-[11px] uppercase tracking-wider text-slate-300 dark:text-slate-400 font-semibold mb-0.5">
+                    Grand Total
+                  </div>
+                  <div className="text-3xl sm:text-4xl font-extrabold font-mono text-white tracking-tight">
+                    <AnimatedGrandTotal value={effectiveGrandTotal} showIndicator />
                   </div>
                 </div>
               </div>
             </div>
-          )
+          </div>
         ) : (
-          <div className="flex flex-col items-center">
-            {renderColumnCard(
-              items,
-              sum,
-              detectedTitle || "Vertical Column",
-              items.map((it) => it.value).join(" + ") + " = " + sum,
-              existingWrittenSum,
-              0
-            )}
+          <div className="flex flex-col items-center w-full">
+            {/* Prominent Single Column Hero Result Banner */}
+            <div className="w-full max-w-md mx-auto mb-4 p-4 rounded-2xl bg-gradient-to-br from-blue-700 via-indigo-700 to-slate-900 text-white shadow-md border border-blue-600/40">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="px-2 py-0.5 rounded-full bg-white/20 text-white text-[11px] font-bold uppercase tracking-wider">
+                      Calculation Result
+                    </span>
+                    <span className="text-xs text-blue-100/90">
+                      {items.length} {items.length === 1 ? "number" : "numbers"} added
+                    </span>
+                  </div>
+                  <div
+                    className="text-xs text-blue-100 font-mono mt-0.5 truncate max-w-[200px] sm:max-w-xs"
+                    title={items.map((it) => it.value).join(" + ") + " = " + sum}
+                  >
+                    {items.length > 0 ? items.map((it) => it.value).join(" + ") : "0"}
+                  </div>
+                </div>
+
+                <div className="text-right shrink-0">
+                  <div className="text-[11px] uppercase tracking-wider text-blue-200 font-semibold mb-0.5">
+                    Total Sum
+                  </div>
+                  <div className="text-3xl sm:text-4xl font-black font-mono text-white tracking-tight">
+                    <AnimatedGrandTotal value={sum} showIndicator />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="w-full max-w-md mx-auto">
+              {renderColumnCard(
+                items,
+                sum,
+                detectedTitle || "Vertical Column",
+                items.map((it) => it.value).join(" + ") + " = " + sum,
+                existingWrittenSum,
+                0
+              )}
+            </div>
           </div>
         )}
 
@@ -797,12 +1403,141 @@ export const VerticalSumDisplay: React.FC<VerticalSumDisplayProps> = ({
               >
                 Cancel
               </button>
+              {formatNormalizedInputHint(newRowValue) && (
+                <div className="w-full text-[11px] text-amber-600 dark:text-amber-400 font-medium flex items-center gap-1 mt-1">
+                  <span>⚡ 3-digit rule:</span>
+                  <span className="font-mono font-bold">{formatNormalizedInputHint(newRowValue)}</span>
+                </div>
+              )}
             </form>
           )}
 
           <span className="text-[11px] text-slate-400 dark:text-slate-500 hidden sm:inline">
             Click any number to edit
           </span>
+        </div>
+      </div>
+
+      {/* Professional Export & Share Hub */}
+      <div className="p-4 sm:p-5 bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900 text-white rounded-2xl mx-4 sm:mx-6 my-4 border border-slate-700/60 shadow-md">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-3">
+          <div>
+            <h4 className="text-xs font-bold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+              <Download className="w-3.5 h-3.5" />
+              Professional Export &amp; Share
+            </h4>
+            <p className="text-[11px] text-slate-300 mt-0.5">
+              Download or share official reports in Excel (.xlsx) and PDF with your calculation dates and notes.
+            </p>
+          </div>
+          {shareFeedback && (
+            <div className="px-3 py-1 rounded-full bg-emerald-500/20 border border-emerald-400/40 text-emerald-300 text-xs font-medium inline-flex items-center gap-1.5 animate-fade-in self-start sm:self-auto">
+              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+              <span>{shareFeedback}</span>
+            </div>
+          )}
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+          {/* 1. Download Excel */}
+          <button
+            type="button"
+            onClick={handleExportExcel}
+            disabled={isExportingExcel}
+            className="p-3 rounded-xl bg-emerald-600/90 hover:bg-emerald-500 text-white text-left transition-all border border-emerald-500/40 shadow-xs cursor-pointer group flex flex-col justify-between min-h-[78px] disabled:opacity-50"
+          >
+            <div className="flex items-center justify-between">
+              <FileSpreadsheet className="w-5 h-5 text-emerald-200 group-hover:scale-110 transition-transform" />
+              <Download className="w-3.5 h-3.5 text-emerald-200/80" />
+            </div>
+            <div>
+              <div className="text-xs font-bold leading-tight">Download Excel</div>
+              <div className="text-[10px] text-emerald-100/80">.xlsx Spreadsheet</div>
+            </div>
+          </button>
+
+          {/* 2. Share Excel File */}
+          <button
+            type="button"
+            onClick={handleShareExcel}
+            disabled={isSharingExcel}
+            className="p-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-white text-left transition-all border border-emerald-500/30 shadow-xs cursor-pointer group flex flex-col justify-between min-h-[78px] disabled:opacity-50"
+          >
+            <div className="flex items-center justify-between">
+              <FileSpreadsheet className="w-5 h-5 text-emerald-400 group-hover:scale-110 transition-transform" />
+              <Share2 className="w-3.5 h-3.5 text-slate-400" />
+            </div>
+            <div>
+              <div className="text-xs font-bold leading-tight">Share Excel File</div>
+              <div className="text-[10px] text-slate-400">WhatsApp / Email</div>
+            </div>
+          </button>
+
+          {/* 3. Download PDF Report */}
+          <button
+            type="button"
+            onClick={handleExportPdf}
+            disabled={isExportingPdf}
+            className="p-3 rounded-xl bg-rose-600/90 hover:bg-rose-500 text-white text-left transition-all border border-rose-500/40 shadow-xs cursor-pointer group flex flex-col justify-between min-h-[78px] disabled:opacity-50"
+          >
+            <div className="flex items-center justify-between">
+              <FileText className="w-5 h-5 text-rose-200 group-hover:scale-110 transition-transform" />
+              <Download className="w-3.5 h-3.5 text-rose-200/80" />
+            </div>
+            <div>
+              <div className="text-xs font-bold leading-tight">Download PDF</div>
+              <div className="text-[10px] text-rose-100/80">Printable Report</div>
+            </div>
+          </button>
+
+          {/* 4. Share PDF File */}
+          <button
+            type="button"
+            onClick={handleSharePdf}
+            disabled={isSharingPdf}
+            className="p-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-white text-left transition-all border border-rose-500/30 shadow-xs cursor-pointer group flex flex-col justify-between min-h-[78px] disabled:opacity-50"
+          >
+            <div className="flex items-center justify-between">
+              <FileText className="w-5 h-5 text-rose-400 group-hover:scale-110 transition-transform" />
+              <Share2 className="w-3.5 h-3.5 text-slate-400" />
+            </div>
+            <div>
+              <div className="text-xs font-bold leading-tight">Share PDF File</div>
+              <div className="text-[10px] text-slate-400">WhatsApp / Email</div>
+            </div>
+          </button>
+        </div>
+
+        {/* Secondary quick actions: Preview PDF & Copy Summary */}
+        <div className="flex items-center justify-between gap-2 mt-3 pt-2.5 border-t border-slate-700/60 text-xs text-slate-400">
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={handlePreviewPdf}
+              className="hover:text-white inline-flex items-center gap-1 transition-colors cursor-pointer"
+            >
+              <Eye className="w-3.5 h-3.5 text-blue-400" />
+              <span>Preview PDF in Tab</span>
+            </button>
+            <span>•</span>
+            <button
+              type="button"
+              onClick={handleShare}
+              className="hover:text-white inline-flex items-center gap-1 transition-colors cursor-pointer"
+            >
+              <Share2 className="w-3.5 h-3.5 text-slate-400" />
+              <span>Share Text Summary</span>
+            </button>
+          </div>
+
+          <button
+            type="button"
+            onClick={handleCopy}
+            className="hover:text-white inline-flex items-center gap-1 transition-colors cursor-pointer"
+          >
+            {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+            <span>{copied ? "Copied" : "Copy Numbers"}</span>
+          </button>
         </div>
       </div>
 

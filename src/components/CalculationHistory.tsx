@@ -1,14 +1,16 @@
 import React, { useState } from "react";
 import { HistoryRecord } from "../types";
-import { History, Trash2, ArrowRight, Share2, Check, FileText, FileSpreadsheet, Calendar } from "lucide-react";
+import { History, Trash2, ArrowRight, Share2, Check, FileText, FileSpreadsheet, Calendar, Pencil, X } from "lucide-react";
 import { shareCalculation } from "../utils/share";
 import { exportToPdf, exportToExcel, formatCurrentDateTime } from "../utils/export";
+import { formatDisplayNumber } from "../utils/math";
 
 interface CalculationHistoryProps {
   history: HistoryRecord[];
   onSelectRecord: (record: HistoryRecord) => void;
   onClearHistory: () => void;
   onShareSuccess?: (msg: string) => void;
+  onRenameRecord?: (id: string, newTitle: string) => void;
 }
 
 export const CalculationHistory: React.FC<CalculationHistoryProps> = ({
@@ -16,12 +18,40 @@ export const CalculationHistory: React.FC<CalculationHistoryProps> = ({
   onSelectRecord,
   onClearHistory,
   onShareSuccess,
+  onRenameRecord,
 }) => {
   const [sharedId, setSharedId] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editTitle, setEditTitle] = useState<string>("");
 
   if (history.length === 0) {
     return null;
   }
+
+  const handleStartEdit = (e: React.MouseEvent, rec: HistoryRecord) => {
+    e.stopPropagation();
+    setEditingId(rec.id);
+    setEditTitle(rec.title);
+  };
+
+  const handleCancelEdit = (e?: React.MouseEvent | React.KeyboardEvent) => {
+    if (e) e.stopPropagation();
+    setEditingId(null);
+    setEditTitle("");
+  };
+
+  const handleSaveEdit = (e: React.MouseEvent | React.FormEvent, rec: HistoryRecord) => {
+    e.stopPropagation();
+    e.preventDefault();
+    const trimmed = editTitle.trim();
+    if (trimmed && trimmed !== rec.title) {
+      if (onRenameRecord) {
+        onRenameRecord(rec.id, trimmed);
+      }
+    }
+    setEditingId(null);
+    setEditTitle("");
+  };
 
   const handleShareItem = async (e: React.MouseEvent, rec: HistoryRecord) => {
     e.stopPropagation();
@@ -123,9 +153,59 @@ export const CalculationHistory: React.FC<CalculationHistoryProps> = ({
                   </div>
                 )}
                 <div className="min-w-0">
-                  <div className="text-xs font-semibold text-slate-800 dark:text-slate-100 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors truncate">
-                    {rec.title}
-                  </div>
+                  {editingId === rec.id ? (
+                    <div
+                      className="flex items-center gap-1.5 py-0.5"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <input
+                        type="text"
+                        value={editTitle}
+                        onChange={(e) => setEditTitle(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            handleSaveEdit(e, rec);
+                          } else if (e.key === "Escape") {
+                            handleCancelEdit(e);
+                          }
+                        }}
+                        autoFocus
+                        className="text-xs font-semibold px-2 py-0.5 rounded-md border border-blue-400 dark:border-blue-500 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-100 focus:outline-hidden focus:ring-1 focus:ring-blue-500 w-36 sm:w-52"
+                        placeholder="Session title..."
+                        maxLength={80}
+                      />
+                      <button
+                        type="button"
+                        onClick={(e) => handleSaveEdit(e, rec)}
+                        className="p-1 rounded bg-blue-600 hover:bg-blue-700 text-white cursor-pointer shadow-xs transition-colors shrink-0"
+                        title="Save title"
+                      >
+                        <Check className="w-3 h-3" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleCancelEdit}
+                        className="p-1 rounded bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 cursor-pointer transition-colors shrink-0"
+                        title="Cancel"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span className="text-xs font-semibold text-slate-800 dark:text-slate-100 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors truncate">
+                        {rec.title}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={(e) => handleStartEdit(e, rec)}
+                        className="p-0.5 rounded text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer shrink-0 opacity-70 group-hover:opacity-100"
+                        title="Rename calculation session"
+                      >
+                        <Pencil className="w-3 h-3" />
+                      </button>
+                    </div>
+                  )}
                   <div className="text-[11px] text-slate-500 dark:text-slate-400 flex items-center gap-1">
                     <Calendar className="w-3 h-3 text-slate-400 dark:text-slate-500" />
                     <span>{itemDate.fullDisplay}</span>
@@ -138,7 +218,7 @@ export const CalculationHistory: React.FC<CalculationHistoryProps> = ({
               <div className="flex items-center gap-2 shrink-0 ml-3">
                 <div className="text-right">
                   <div className="text-sm font-mono font-bold text-slate-900 dark:text-slate-100">
-                    {rec.sum}
+                    {formatDisplayNumber(rec.sum)}
                   </div>
                   <div className="text-[10px] text-slate-400 dark:text-slate-500 font-mono hidden sm:block">
                     {rec.items.map((i) => i.value).slice(0, 3).join("+")}

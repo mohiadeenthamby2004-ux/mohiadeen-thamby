@@ -12,12 +12,64 @@ export default defineConfig(() => {
       VitePWA({
         registerType: 'autoUpdate',
         injectRegister: null,
-        manifest: false,
+        devOptions: {
+          enabled: true,
+          type: 'module',
+        },
+        includeAssets: ['icon.svg', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png'],
+        manifest: {
+          id: '/',
+          name: 'Measurement Chart',
+          short_name: 'MeasureChart',
+          description: 'Scan or snap photos of measurement charts, tannery tally sheets, waybills, and vertical number columns with offline arithmetic.',
+          start_url: '/',
+          scope: '/',
+          display: 'standalone',
+          orientation: 'any',
+          theme_color: '#2563eb',
+          background_color: '#0f172a',
+          categories: ['utilities', 'productivity', 'finance'],
+          icons: [
+            {
+              src: '/pwa-192x192.png',
+              sizes: '192x192',
+              type: 'image/png',
+              purpose: 'any',
+            },
+            {
+              src: '/pwa-512x512.png',
+              sizes: '512x512',
+              type: 'image/png',
+              purpose: 'any',
+            },
+            {
+              src: '/pwa-maskable-512x512.png',
+              sizes: '512x512',
+              type: 'image/png',
+              purpose: 'maskable',
+            },
+          ],
+        },
         workbox: {
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
-        },
-        devOptions: {
-          enabled: false,
+          runtimeCaching: [
+            {
+              urlPattern: ({ request }) =>
+                request.destination === 'document' ||
+                request.destination === 'script' ||
+                request.destination === 'style' ||
+                request.destination === 'image' ||
+                request.destination === 'font',
+              handler: 'StaleWhileRevalidate',
+              options: {
+                cacheName: 'measurement-chart-offline-cache',
+                expiration: {
+                  maxEntries: 120,
+                  maxAgeSeconds: 60 * 60 * 24 * 30, // 30 days
+                },
+              },
+            },
+          ],
         },
       }),
     ],

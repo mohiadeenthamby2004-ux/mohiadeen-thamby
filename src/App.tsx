@@ -6,14 +6,26 @@ import { CalculationHistory } from "./components/CalculationHistory";
 import { DetectedNumberItem, HistoryRecord, CalculationResult, VerticalColumnLine, MeasurementMetadata } from "./types";
 import {
   computeSafeSum,
+  formatDisplayNumber,
   generateSampleCanvasImage,
   generateMultiColumnCanvasImage,
   generateTanneryMeasurementChartCanvasImage,
+  getPresetCalculationResult,
+  partitionIntoMultipleColumns,
 } from "./utils/math";
 import { shareCalculation } from "./utils/share";
-import { exportToPdf, exportToExcel, formatCurrentDateTime } from "./utils/export";
+import {
+  exportToPdf,
+  exportToExcel,
+  sharePdfFile,
+  shareExcelFile,
+  formatCurrentDateTime,
+} from "./utils/export";
 import { PWAInstallButton } from "./components/PWAInstallButton";
 import { OfflineIndicator } from "./components/OfflineIndicator";
+import { ExportShareModal } from "./components/ExportShareModal";
+import { analyzeImageOffline } from "./utils/offlineAnalyzer";
+import { optimizeImageForOcr } from "./utils/imageOptimizer";
 import {
   Calculator,
   Camera,
@@ -63,6 +75,30 @@ export default function App() {
   const [calculationDate, setCalculationDate] = useState<number>(() => Date.now());
   const [measurementMetadata, setMeasurementMetadata] = useState<MeasurementMetadata | undefined>(undefined);
   const [isMeasurementChart, setIsMeasurementChart] = useState<boolean>(false);
+  const [isShareModalOpen, setIsShareModalOpen] = useState<boolean>(false);
+  const [shareModalFormat, setShareModalFormat] = useState<"pdf" | "excel">("pdf");
+
+  // Online / Offline connectivity listener
+  const [isOnline, setIsOnline] = useState<boolean>(() => {
+    return typeof navigator !== "undefined" ? navigator.onLine : true;
+  });
+
+  useEffect(() => {
+    const handleOnline = () => {
+      setIsOnline(true);
+      showToast("🌐 Connection active: Cloud AI vision scanning ready.");
+    };
+    const handleOffline = () => {
+      setIsOnline(false);
+      showToast("⚡ Offline Mode: Local arithmetic & PWA active.");
+    };
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
 
   // Synchronize dark mode class to <html> element
   useEffect(() => {
@@ -157,23 +193,116 @@ export default function App() {
     setCalculationDate(scanTimestamp);
 
     try {
-      const response = await fetch("/api/calculate-photo", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          image: imageDataUrl,
-          mimeType: "image/jpeg",
-          preset: presetName,
-        }),
-      });
-
-      const data: CalculationResult = await response.json();
-
-      if (!response.ok || !data.success) {
-        throw new Error(data.error || "Failed to recognize vertical numbers from this image.");
+      // 1. Client-Side Image Optimization: downscale to ~1400px max dimension, quality 0.85
+      // Reduces 8MB-15MB phone photos to ~180KB for instantaneous upload without timeouts
+      let optimizedImage = imageDataUrl;
+      try {
+        optimizedImage = await optimizeImageForOcr(imageDataUrl, { maxDimension: 1400, quality: 0.85 });
+      } catch (optErr) {
+        console.warn("Image optimization notice, continuing with raw image:", optErr);
       }
 
-      setCurrentImage(imageDataUrl);
+      let data: CalculationResult;
+      let usedOfflineMode = false;
+
+      if (presetName) {
+        // Direct instant client-side calculation for calibrated presets
+        data = getPresetCalculationResult(presetName);
+      } else {
+        const isOfflineEnvironment =
+          typeof window !== "undefined" &&
+          (window.location.protocol === "file:" || !navigator.onLine);
+
+        if (isOfflineEnvironment) {
+          // In offline mode: inspect canvas. For custom user photos, returns guidance to enter numbers
+          data = await analyzeImageOffline(optimizedImage, titleHint, presetName);
+          usedOfflineMode = true;
+        } else {
+          // Online mode: call Gemini-powered OCR backend
+          try {
+            const controller = new AbortController();
+            let isTimedOut = false;
+            const timeoutId = setTimeout(() => {
+              isTimedOut = true;
+              try {
+                controller.abort("Document analysis timed out due to temporary network delay.");
+              } catch (_) {
+                controller.abort();
+              }
+            }, 65000);
+
+            const response = await fetch("/api/calculate-photo", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                image: optimizedImage,
+                mimeType: "image/jpeg",
+                preset: presetName,
+              }),
+              signal: controller.signal,
+            });
+            clearTimeout(timeoutId);
+
+            if (!response.ok) {
+              const errBody = await response.json().catch(() => ({}));
+              throw new Error(errBody.error || `Server returned status ${response.status}`);
+            }
+            const serverData = await response.json();
+            if (!serverData.success) {
+              throw new Error(serverData.error || "Could not read numbers from this photo.");
+            }
+            data = serverData;
+          } catch (fetchErr: any) {
+            console.warn("Online OCR request notice:", fetchErr);
+            const errMsg = String(fetchErr?.message || "").toLowerCase();
+            const isTimeout =
+              fetchErr?.name === "AbortError" ||
+              errMsg.includes("timed out") ||
+              errMsg.includes("timeout");
+            const isTemporaryIssue =
+              errMsg.includes("503") ||
+              errMsg.includes("high demand") ||
+              errMsg.includes("failed to fetch") ||
+              !navigator.onLine;
+
+            // In case of timeout or network interruption, gracefully load the photo with editable columns
+            if (isTimeout || isTemporaryIssue) {
+              try {
+                data = await analyzeImageOffline(optimizedImage, titleHint, presetName);
+                usedOfflineMode = true;
+                showToast("⚡ Photo loaded into interactive multi-column table for direct editing & calculation");
+              } catch (fallbackErr) {
+                throw new Error(
+                  "Document analysis timed out due to temporary network delay. You can tap 'Retry Analysis' or select an instant preset."
+                );
+              }
+            } else {
+              throw fetchErr;
+            }
+          }
+        }
+      }
+
+      // Check if data returned an error or no valid numbers
+      if (!data.success) {
+        throw new Error(data.error || "No clear numbers could be detected in this photo.");
+      }
+
+      const hasValidItems =
+        (data.columns && data.columns.length > 0 && data.columns.some((c) => c.items.length > 0)) ||
+        (data.items && data.items.length > 0);
+
+      if (!hasValidItems) {
+        throw new Error(
+          "No clearly legible numbers were found in this photo. Please make sure the photo is well-lit and in focus, or enter the numbers manually into the table."
+        );
+      }
+
+      if (usedOfflineMode) {
+        showToast("⚡ Analyzed on device");
+      }
+
+      setCurrentImage(optimizedImage);
       setDetectedTitle(data.detectedTitle || titleHint);
       setNotes(data.notes || "");
       setExistingWrittenSum(data.existingWrittenSum);
@@ -193,24 +322,44 @@ export default function App() {
         setGrandFormula(data.grandFormula);
         setSum(data.grandTotal ?? computeSafeSum(data.columns.map((c) => c.sum)).sum);
       } else {
-        // Single column calculation
-        setColumns([]);
-        setGrandTotal(undefined);
-        setGrandFormula(undefined);
-        const detectedItems = data.items || [];
+        const detectedItems =
+          data.items && data.items.length > 0
+            ? data.items
+            : data.columns && data.columns[0]?.items
+            ? data.columns[0].items
+            : [];
         setItems(detectedItems);
 
-        const calculatedSum = computeSafeSum(detectedItems).sum;
-        setSum(calculatedSum);
+        // If 4 or more numbers are detected, automatically partition into multiple columns
+        if (detectedItems.length >= 4) {
+          const colCount = detectedItems.length >= 24 ? 8 : (detectedItems.length >= 10 ? 4 : 2);
+          const multiCols = partitionIntoMultipleColumns(detectedItems, colCount);
+          setColumns(multiCols);
+          const calculatedGrandTotal = computeSafeSum(multiCols.map((c) => c.sum)).sum;
+          setGrandTotal(calculatedGrandTotal);
+          setSum(calculatedGrandTotal);
+          setGrandFormula(multiCols.map((c) => `${c.title} (${c.sum})`).join(" + ") + ` = ${calculatedGrandTotal}`);
+        } else {
+          setColumns(data.columns && data.columns.length > 0 ? data.columns : []);
+          setGrandTotal(undefined);
+          setGrandFormula(undefined);
+          const calculatedSum =
+            typeof data.sum === "number" && !isNaN(data.sum) && data.sum !== 0
+              ? data.sum
+              : computeSafeSum(detectedItems).sum;
+          setSum(calculatedSum);
+        }
         setMaxDecimals(data.maxDecimals || 1);
       }
 
       // Record to calculation history with timestamp
-      const totalSum = data.grandTotal ?? data.sum ?? 0;
+      const totalSum =
+        data.grandTotal ??
+        (typeof data.sum === "number" && !isNaN(data.sum) ? data.sum : computeSafeSum(data.items || []).sum);
       saveToHistory({
         id: `rec-${scanTimestamp}`,
         timestamp: scanTimestamp,
-        thumbnail: imageDataUrl,
+        thumbnail: optimizedImage,
         title: data.detectedTitle || titleHint,
         sum: totalSum,
         items: data.items || (data.columns ? data.columns.flatMap((c) => c.items) : []),
@@ -224,10 +373,43 @@ export default function App() {
       playChime();
     } catch (err: any) {
       console.error("Calculation error:", err);
-      setError(
-        err.message ||
-          "Could not analyze numbers in photo. Please ensure numbers are visible, or try one of the quick presets below."
-      );
+      const rawMsg = String(err?.message || "");
+      const isAbort =
+        err?.name === "AbortError" ||
+        rawMsg.toLowerCase().includes("aborted") ||
+        rawMsg.toLowerCase().includes("signal is aborted") ||
+        rawMsg.toLowerCase().includes("timeout") ||
+        rawMsg.toLowerCase().includes("timed out");
+
+      const errorMsg = isAbort
+        ? "Document analysis timed out. Your photo is loaded on the left — you can enter your numbers directly into the column table or retry scanning."
+        : rawMsg ||
+          "Could not detect numbers from this photo. You can enter them manually into the table on the right, or take a clearer photo.";
+
+      setError(errorMsg);
+      showToast(`⚠️ ${errorMsg}`);
+
+      // Crucial: Retain the user's uploaded photo in view so they can see the original document!
+      setCurrentImage(imageDataUrl);
+      setDetectedTitle(titleHint || "Scanned Photo");
+      setIsMeasurementChart(false);
+      setMeasurementMetadata(undefined);
+      setNotes("Numbers could not be automatically detected. Enter numbers into the column table to calculate instantly.");
+
+      // Initialize an empty column ready for manual input with live addition
+      const initialCol: VerticalColumnLine = {
+        id: "col-manual-1",
+        title: "Column 1",
+        items: [],
+        sum: 0,
+        formula: "0",
+        maxDecimals: 1,
+      };
+      setColumns([initialCol]);
+      setItems([]);
+      setSum(0);
+      setGrandTotal(undefined);
+      setGrandFormula(undefined);
     } finally {
       setIsLoading(false);
     }
@@ -336,12 +518,49 @@ export default function App() {
       setGrandTotal(rec.grandTotal);
       setSum(rec.grandTotal ?? rec.sum);
       setItems(rec.items);
+    } else if (rec.items && rec.items.length >= 4) {
+      const colCount = rec.items.length >= 24 ? 8 : (rec.items.length >= 10 ? 4 : 2);
+      const multiCols = partitionIntoMultipleColumns(rec.items, colCount);
+      setColumns(multiCols);
+      const calculatedGrandTotal = computeSafeSum(multiCols.map((c) => c.sum)).sum;
+      setGrandTotal(calculatedGrandTotal);
+      setSum(calculatedGrandTotal);
+      setItems(rec.items);
     } else {
-      setColumns([]);
+      setColumns(rec.columns || []);
       setGrandTotal(undefined);
       setItems(rec.items);
       setSum(rec.sum);
     }
+  };
+
+  // Rename title for a historical calculation session
+  const handleRenameRecord = (id: string, newTitle: string) => {
+    setHistory((prev) => {
+      const updated = prev.map((rec) => {
+        if (rec.id === id) {
+          return { ...rec, title: newTitle };
+        }
+        return rec;
+      });
+      try {
+        localStorage.setItem("photo_calc_history", JSON.stringify(updated));
+      } catch (e) {
+        console.warn("Could not write updated title to localStorage", e);
+      }
+      return updated;
+    });
+
+    // If this session is currently active in the viewer, update detectedTitle
+    const activeRec = history.find((r) => r.id === id);
+    if (
+      activeRec &&
+      (activeRec.timestamp === calculationDate || (currentImage && activeRec.thumbnail === currentImage))
+    ) {
+      setDetectedTitle(newTitle);
+    }
+
+    showToast(`Renamed calculation to "${newTitle}"`);
   };
 
   // Update notes for the current calculation session and persist to history
@@ -393,42 +612,127 @@ export default function App() {
   };
 
   const handleExportCurrentPdf = () => {
-    const success = exportToPdf({
-      title: detectedTitle || "Vertical Addition Result",
-      items,
-      sum,
-      columns,
-      grandTotal,
-      grandFormula,
-      existingWrittenSum,
-      notes,
-      imageSrc: currentImage,
-      calculationDate,
-      measurementMetadata,
-      isMeasurementChart,
-    });
-    if (success) {
-      showToast("PDF calculation report downloaded!");
+    try {
+      const success = exportToPdf({
+        title: detectedTitle || "Measurement Chart",
+        items,
+        sum,
+        columns,
+        grandTotal,
+        grandFormula,
+        existingWrittenSum,
+        notes,
+        imageSrc: currentImage,
+        calculationDate,
+        measurementMetadata,
+        isMeasurementChart: isMeasurementChart || (columns && columns.length >= 4),
+      });
+      if (success) {
+        showToast("PDF calculation report downloaded!");
+      } else {
+        showToast("PDF generation ready. If blocked, check popup permissions.");
+      }
+    } catch (err) {
+      console.error("Export PDF error:", err);
+      showToast("Could not download PDF.");
     }
   };
 
+  const handleShareCurrentPdf = () => {
+    handleOpenShareModal("pdf");
+  };
+
   const handleExportCurrentExcel = () => {
-    const success = exportToExcel({
-      title: detectedTitle || "Vertical Addition Result",
-      items,
-      sum,
-      columns,
-      grandTotal,
-      grandFormula,
-      existingWrittenSum,
-      notes,
-      calculationDate,
-      measurementMetadata,
-      isMeasurementChart,
-    });
-    if (success) {
-      showToast("Excel calculation spreadsheet downloaded!");
+    try {
+      const success = exportToExcel({
+        title: detectedTitle || "Measurement Chart",
+        items,
+        sum,
+        columns,
+        grandTotal,
+        grandFormula,
+        existingWrittenSum,
+        notes,
+        calculationDate,
+        measurementMetadata,
+        isMeasurementChart: isMeasurementChart || (columns && columns.length >= 4),
+      });
+      if (success) {
+        showToast("Excel calculation spreadsheet (.xlsx) downloaded!");
+      } else {
+        showToast("Excel file generated.");
+      }
+    } catch (err) {
+      console.error("Export Excel error:", err);
+      showToast("Could not download Excel.");
     }
+  };
+
+  const handleShareCurrentExcel = () => {
+    handleOpenShareModal("excel");
+  };
+
+  const handleOpenShareModal = (format: "pdf" | "excel" = "pdf") => {
+    setShareModalFormat(format);
+    setIsShareModalOpen(true);
+  };
+
+  // Start a new blank calculation sheet immediately (works 100% offline without needing a photo)
+  const handleStartBlankSheet = (colsCount: number = 2) => {
+    const defaultCols: VerticalColumnLine[] = [];
+    const defaultItems: DetectedNumberItem[] = [];
+    for (let c = 0; c < colsCount; c++) {
+      const colItems: DetectedNumberItem[] = [
+        {
+          id: `manual-c${c}-r0-${Date.now()}`,
+          value: 0,
+          rawText: "0",
+          label: "Row 1",
+          columnIndex: c,
+        },
+      ];
+      defaultItems.push(...colItems);
+      defaultCols.push({
+        id: `col-${c + 1}-${Date.now()}`,
+        title: colsCount >= 4 ? `Column ${c + 1}` : `Col ${c + 1}`,
+        items: colItems,
+        sum: 0,
+        formula: "0",
+        maxDecimals: 1,
+      });
+    }
+
+    const canvas = document.createElement("canvas");
+    canvas.width = 600;
+    canvas.height = 800;
+    const ctx = canvas.getContext("2d");
+    if (ctx) {
+      ctx.fillStyle = "#f8fafc";
+      ctx.fillRect(0, 0, 600, 800);
+      ctx.strokeStyle = "#cbd5e1";
+      ctx.lineWidth = 1;
+      for (let y = 40; y < 800; y += 40) {
+        ctx.beginPath();
+        ctx.moveTo(20, y);
+        ctx.lineTo(580, y);
+        ctx.stroke();
+      }
+    }
+    const cleanGridDataUrl = canvas.toDataURL("image/png");
+
+    setCurrentImage(cleanGridDataUrl);
+    setDetectedTitle(colsCount >= 4 ? "Tannery Measurement Chart" : "Calculation Sheet");
+    setItems(defaultItems);
+    setSum(0);
+    setMaxDecimals(1);
+    setColumns(defaultCols);
+    setGrandTotal(0);
+    setGrandFormula("Ready for numbers");
+    setIsMeasurementChart(colsCount >= 4);
+    setNotes("Offline calculation sheet. Tap any cell to enter numbers.");
+    setCalculationDate(Date.now());
+    setError(null);
+    showToast(`⚡ New ${colsCount}-column calculation sheet ready.`);
   };
 
   const currentDateObj = formatCurrentDateTime(calculationDate);
@@ -444,15 +748,39 @@ export default function App() {
             </div>
             <div>
               <h1 className="text-base sm:text-lg font-bold text-slate-900 dark:text-slate-100 leading-tight">
-                Photo Addition Calculator
+                Measurement Chart
               </h1>
               <p className="text-xs text-slate-500 dark:text-slate-400 font-medium">
-                Automatic vertical line &amp; multi-column sum with PDF and Excel export
+                Offline measurement chart, tannery tally &amp; vertical sum calculator
               </p>
             </div>
           </div>
 
           <div className="flex items-center space-x-2">
+            {/* Online / Offline Status Badge */}
+            <div
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border text-xs font-semibold ${
+                isOnline
+                  ? "bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800/80 text-emerald-700 dark:text-emerald-300"
+                  : "bg-amber-50 dark:bg-amber-950/40 border-amber-200 dark:border-amber-800/80 text-amber-700 dark:text-amber-300"
+              }`}
+              title={
+                isOnline
+                  ? "Connected to Internet: Cloud AI OCR is ready"
+                  : "Working 100% Offline: Local calculation engine & offline storage active"
+              }
+            >
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  isOnline ? "bg-emerald-500" : "bg-amber-500 animate-pulse"
+                }`}
+              />
+              <span className="hidden sm:inline">{isOnline ? "Online" : "Offline"}</span>
+            </div>
+
+            {/* PWA Install / APK Download Button */}
+            <PWAInstallButton />
+
             {/* Dark Mode Theme Toggle */}
             <button
               type="button"
@@ -481,11 +809,6 @@ export default function App() {
                 <VolumeX className="w-4 h-4 text-slate-400 dark:text-slate-500" />
               )}
             </button>
-
-            <div className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-300">
-              <Sparkles className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-              <span>Multi-Model Vision OCR</span>
-            </div>
           </div>
         </div>
       </header>
@@ -532,11 +855,17 @@ export default function App() {
             {/* Guide Card */}
             <div className="p-4 sm:p-5 rounded-2xl bg-gradient-to-r from-blue-600 via-indigo-600 to-slate-900 dark:from-blue-700 dark:via-indigo-800 dark:to-slate-900 text-white shadow-sm flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
               <div>
-                <div className="flex items-center gap-2 mb-1">
+                <div className="flex items-center gap-2 mb-1 flex-wrap">
                   <span className="px-2 py-0.5 rounded-full bg-white/20 text-[11px] font-semibold tracking-wide uppercase">
                     Single &amp; Multiple Vertical Lines
                   </span>
                   <span className="text-xs text-blue-100 font-mono">33.3 + 32.2 = 65.5</span>
+                  <span
+                    className="px-2 py-0.5 rounded-full bg-amber-400/25 text-amber-200 text-[11px] font-semibold border border-amber-300/30 font-mono"
+                    title="When performing addition, any 3-digit number has a decimal point placed after the first two digits (e.g., 333 as 33.3)"
+                  >
+                    3-digit rule: 333 → 33.3
+                  </span>
                 </div>
                 <h2 className="text-lg sm:text-xl font-bold tracking-tight">
                   Take a photo of any vertical numbers
@@ -549,11 +878,29 @@ export default function App() {
               <div className="flex flex-wrap items-center gap-2 shrink-0">
                 <button
                   type="button"
+                  onClick={() => handleStartBlankSheet(2)}
+                  className="px-3.5 py-2.5 rounded-xl bg-emerald-500/25 hover:bg-emerald-500/35 border border-emerald-300/40 text-emerald-100 font-semibold text-xs inline-flex items-center gap-1.5 shadow-xs transition-colors cursor-pointer"
+                  title="Create an empty calculation sheet immediately (no photo required, 100% offline)"
+                >
+                  <Calculator className="w-4 h-4 text-emerald-300" />
+                  <span>⚡ Blank Sheet (2 Cols)</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleStartBlankSheet(8)}
+                  className="px-3.5 py-2.5 rounded-xl bg-amber-500/25 hover:bg-amber-500/35 border border-amber-300/40 text-amber-100 font-semibold text-xs inline-flex items-center gap-1.5 shadow-xs transition-colors cursor-pointer"
+                  title="Create an empty 8-column tannery measurement tally sheet immediately"
+                >
+                  <FileSpreadsheet className="w-4 h-4 text-amber-300" />
+                  <span>⚡ Tannery Chart (8 Cols)</span>
+                </button>
+                <button
+                  type="button"
                   onClick={() => handleSelectPreset("example-33-32")}
                   className="px-3.5 py-2.5 rounded-xl bg-white dark:bg-slate-800 text-blue-800 dark:text-blue-300 hover:bg-blue-50 dark:hover:bg-slate-700 font-semibold text-xs inline-flex items-center gap-1.5 shadow-xs transition-colors cursor-pointer"
                 >
                   <Sparkles className="w-4 h-4 text-blue-600 dark:text-blue-400" />
-                  <span>Single Line (33.3 + 32.2)</span>
+                  <span>Single Line</span>
                 </button>
                 <button
                   type="button"
@@ -579,6 +926,7 @@ export default function App() {
               onSelectRecord={handleSelectHistoryRecord}
               onClearHistory={handleClearHistory}
               onShareSuccess={showToast}
+              onRenameRecord={handleRenameRecord}
             />
           </div>
         ) : (
@@ -603,46 +951,89 @@ export default function App() {
                   <span>{currentDateObj.fullDisplay}</span>
                 </div>
 
-                {columns.length > 1 && (
-                  <span className="px-2 py-0.5 rounded-full bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200/60 dark:border-indigo-800 text-[11px] font-bold">
-                    Grand Total: {grandTotal ?? sum}
+                {/* Prominent Result Badge in Top Bar */}
+                <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-xs">
+                  <span className="text-[11px] font-bold uppercase tracking-wider opacity-90">
+                    {columns.length > 1 ? "Grand Total:" : "Result:"}
                   </span>
-                )}
+                  <span className="font-mono text-base font-black tracking-tight">
+                    {formatDisplayNumber(grandTotal ?? sum)}
+                  </span>
+                </div>
               </div>
 
-              {/* Action Buttons: Export PDF, Export Excel, Share, Retake */}
+              {/* Action Buttons: PDF (Download/Share), Excel (Download/Share), Share Text, New Photo */}
               <div className="flex items-center gap-2 flex-wrap">
-                <button
-                  type="button"
-                  onClick={handleExportCurrentPdf}
-                  className="px-3 py-2 rounded-xl bg-rose-50 dark:bg-rose-950/40 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-900/60 hover:bg-rose-100 dark:hover:bg-rose-900/50 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
-                  title="Export calculation to formatted PDF document"
-                >
-                  <FileText className="w-3.5 h-3.5 text-rose-600 dark:text-rose-400" />
-                  <span>Export PDF</span>
-                </button>
+                {/* PDF Group */}
+                <div className="inline-flex rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-900/60 p-0.5 shadow-xs">
+                  <button
+                    type="button"
+                    onClick={handleExportCurrentPdf}
+                    className="px-2.5 py-1.5 rounded-lg text-rose-700 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-900/60 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+                    title="Download calculation report as PDF (.pdf)"
+                  >
+                    <FileText className="w-3.5 h-3.5 text-rose-600 dark:text-rose-400" />
+                    <span>Download PDF</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleShareCurrentPdf}
+                    disabled={isSharing}
+                    className="px-2 py-1.5 rounded-lg text-rose-700 dark:text-rose-300 hover:bg-rose-100 dark:hover:bg-rose-900/60 text-xs font-semibold inline-flex items-center gap-1 transition-colors cursor-pointer border-l border-rose-200 dark:border-rose-900/60 disabled:opacity-50"
+                    title="Share PDF file via WhatsApp, Email, etc."
+                  >
+                    <Share2 className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">Share</span>
+                  </button>
+                </div>
 
-                <button
-                  type="button"
-                  onClick={handleExportCurrentExcel}
-                  className="px-3 py-2 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-900/60 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
-                  title="Export calculation to Microsoft Excel spreadsheet (.xlsx)"
-                >
-                  <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
-                  <span>Export Excel</span>
-                </button>
+                {/* Excel Group */}
+                <div className="inline-flex rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-900/60 p-0.5 shadow-xs">
+                  <button
+                    type="button"
+                    onClick={handleExportCurrentExcel}
+                    className="px-2.5 py-1.5 rounded-lg text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/60 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
+                    title="Download calculation spreadsheet as Microsoft Excel (.xlsx)"
+                  >
+                    <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                    <span>Download Excel</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleShareCurrentExcel}
+                    disabled={isSharing}
+                    className="px-2 py-1.5 rounded-lg text-emerald-700 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/60 text-xs font-semibold inline-flex items-center gap-1 transition-colors cursor-pointer border-l border-emerald-200 dark:border-emerald-900/60 disabled:opacity-50"
+                    title="Share Excel (.xlsx) file via WhatsApp, Email, etc."
+                  >
+                    <Share2 className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">Share</span>
+                  </button>
+                </div>
 
+                {/* Text & Image Share */}
                 <button
                   type="button"
                   onClick={handleShareCurrent}
                   disabled={isSharing}
-                  className="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs disabled:opacity-50"
-                  title="Share calculation results or scanned image"
+                  className="px-3 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs disabled:opacity-50"
+                  title="Share formatted calculation summary with photo"
                 >
                   <Share2 className="w-3.5 h-3.5" />
-                  <span>Share</span>
+                  <span>Share Text</span>
                 </button>
 
+                {/* Full Export & Share Sheet Button */}
+                <button
+                  type="button"
+                  onClick={() => handleOpenShareModal("pdf")}
+                  className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-900 text-white dark:bg-slate-700 dark:hover:bg-slate-600 text-xs font-semibold inline-flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
+                  title="Open full PDF and Excel share & export options"
+                >
+                  <Share2 className="w-3.5 h-3.5 text-blue-400" />
+                  <span>Share Sheet</span>
+                </button>
+
+                {/* Retake / New Photo */}
                 <button
                   type="button"
                   onClick={handleRetake}
@@ -694,6 +1085,7 @@ export default function App() {
                   hoveredItemId={hoveredItemId}
                   onHoverItem={setHoveredItemId}
                   onExportSuccess={showToast}
+                  onOpenShareModal={handleOpenShareModal}
                 />
               </div>
             </div>
@@ -704,10 +1096,33 @@ export default function App() {
               onSelectRecord={handleSelectHistoryRecord}
               onClearHistory={handleClearHistory}
               onShareSuccess={showToast}
+              onRenameRecord={handleRenameRecord}
             />
           </div>
         )}
       </main>
+
+      {/* Export & Share Modal with Full Offline & Native App Fallback */}
+      <ExportShareModal
+        isOpen={isShareModalOpen}
+        onClose={() => setIsShareModalOpen(false)}
+        defaultFormat={shareModalFormat}
+        onToast={showToast}
+        data={{
+          title: detectedTitle || "Measurement Chart",
+          items,
+          sum,
+          columns,
+          grandTotal,
+          grandFormula,
+          existingWrittenSum,
+          notes,
+          imageSrc: currentImage,
+          calculationDate,
+          measurementMetadata,
+          isMeasurementChart: isMeasurementChart || (columns && columns.length >= 4),
+        }}
+      />
 
       {/* Toast Notification */}
       {toastMessage && (
@@ -723,7 +1138,7 @@ export default function App() {
       {/* Footer */}
       <footer className="bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-800 mt-auto py-4 text-center text-xs text-slate-400 dark:text-slate-500">
         <div className="max-w-6xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
-          <span>Photo Addition Calculator • Precise Vertical Arithmetic</span>
+          <span>Measurement Chart • Precise Vertical &amp; Matrix Arithmetic</span>
           <span>Automatic date stamping, PDF reports &amp; Excel spreadsheet exports</span>
         </div>
       </footer>
